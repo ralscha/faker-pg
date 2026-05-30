@@ -1,0 +1,144 @@
+version: 3
+
+tasks:
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list
+
+  format:
+    desc: Format Go code
+    cmds:
+      - go fix ./...
+      - go fmt ./...
+
+  build:
+    desc: Build the faker-pg binary
+    deps: [format]
+    cmds:
+      - go build ./cmd/faker-pg
+
+  lint:
+    desc: Run golangci-lint in a Docker container
+    cmds:
+      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app golangci/golangci-lint:v2.12.2 golangci-lint run -v --timeout 5m
+
+  test:
+    desc: Run all tests
+    cmds:
+      - go test -v ./...
+
+  test:cover:
+    desc: Run all tests with coverage
+    cmds:
+      - go test -coverprofile=coverage.out ./...
+      - go tool cover -func=coverage.out
+
+  run:
+    desc: Launch the TUI
+    deps: [build]
+    summary: |
+      Open the TUI, optionally preloading the DSN from a command-line flag.
+
+      Examples:
+        task run
+        task run DSN="postgres://user:pass@localhost:5432/mydb?sslmode=disable"
+    cmds:
+      - go run ./cmd/faker-pg {{if .DSN}}--dsn "{{.DSN}}"{{end}} {{if .LLM_MODEL}}--llm-model "{{.LLM_MODEL}}"{{end}} {{if .LLM_KEY_ENV}}--llm-api-key-env "{{.LLM_KEY_ENV}}"{{end}}
+
+  tui:
+    desc: Launch the TUI
+    cmds:
+      - task: run
+        vars:
+          DSN: '{{.DSN}}'
+          LLM_MODEL: '{{.LLM_MODEL}}'
+          LLM_KEY_ENV: '{{.LLM_KEY_ENV}}'
+
+  dev:db:up:
+    desc: Start a local PostgreSQL container for development
+    cmds:
+      - docker run -d --name faker-pg-dev -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=devdb -p 5432:5432 postgres:18-alpine
+
+  dev:db:down:
+    desc: Stop the development PostgreSQL container
+    cmds:
+      - docker rm -f faker-pg-dev
+
+  demo:setup:
+    desc: Load the demo schema into the dev PostgreSQL container
+    deps: [dev:db:up]
+    summary: |
+      Start a local PG container (if not running) and load demo/demo_schema.sql.
+
+      Requires Docker.  The container is left running afterwards;
+      tear it down with `task dev:db:down`.
+
+      Connection DSN for faker-pg:
+        postgres://postgres:postgres@localhost:5432/devdb?sslmode=disable
+    cmds:
+      - go run ./cmd/wait-for-pg -dsn "postgres://postgres:postgres@localhost:5432/devdb?sslmode=disable" -timeout 30s
+      - cmd /c "docker exec -i faker-pg-dev psql -U postgres -d devdb < demo\demo_schema.sql"
+
+  demo:teardown:
+    desc: Drop the demo schema only (keeps the container)
+    cmds:
+      - cmd /c "echo DROP SCHEMA IF EXISTS demo CASCADE; | docker exec -i faker-pg-dev psql -U postgres -d devdb"
+
+  demo:run:
+    desc: Launch faker-pg TUI against the demo schema
+    summary: |
+      Open the TUI pre-connected to the demo database.
+
+      Run `task demo:setup` first if the schema hasn't been loaded yet.
+    cmds:
+      - task: run
+        vars:
+          DSN: "postgres://postgres:postgres@localhost:5432/devdb?sslmode=disable"
+
+  clean:
+    desc: Remove the built executable if present
+    cmds:
+      - cmd /c "if exist faker-pg.exe del /q faker-pg.exe"
+
+  tag:
+    desc: Create a local git tag for a release
+    summary: |
+      Create a local git tag.
+
+      Run with `task --interactive tag` to be prompted for TAG,
+      or pass it explicitly with `task tag TAG=v1.0.0`.
+    requires:
+      vars: [TAG]
+    preconditions:
+      - sh: 'case "{{.TAG}}" in v*) exit 0 ;; *) exit 1 ;; esac'
+        msg: TAG must start with v, for example v1.0.0
+      - sh: 'if git rev-parse -q --verify "refs/tags/{{.TAG}}" >/dev/null 2>&1; then exit 1; fi; exit 0'
+        msg: Tag already exists locally
+    cmds:
+      - git tag {{.TAG}}
+
+  push-tag:
+    desc: Push an existing git tag to GitHub
+    requires:
+      vars: [TAG]
+    preconditions:
+      - sh: 'case "{{.TAG}}" in v*) exit 0 ;; *) exit 1 ;; esac'
+        msg: TAG must start with v, for example v1.0.0
+      - sh: 'if git rev-parse -q --verify "refs/tags/{{.TAG}}" >/dev/null 2>&1; then exit 0; else exit 1; fi'
+        msg: Tag does not exist locally. Run `task tag TAG=v1.0.0` first.
+    cmds:
+      - git push origin {{.TAG}}
+
+  release-tag:
+    desc: Create and push a release tag to GitHub
+    requires:
+      vars: [TAG]
+    preconditions:
+      - sh: 'case "{{.TAG}}" in v*) exit 0 ;; *) exit 1 ;; esac'
+        msg: TAG must start with v, for example v1.0.0
+      - sh: 'if git rev-parse -q --verify "refs/tags/{{.TAG}}" >/dev/null 2>&1; then exit 1; fi; exit 0'
+        msg: Tag already exists locally
+    cmds:
+      - git tag {{.TAG}}
+      - git push origin {{.TAG}}
