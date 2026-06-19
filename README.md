@@ -1,7 +1,7 @@
 # faker-pg
 
 A terminal UI for anonymizing sensitive data in PostgreSQL databases.
-Connect to any Postgres database, map columns to realistic [gofakeit](https://github.com/brianvoe/gofakeit) generators, then let faker-pg rewrite every row in place.
+Connect to a Postgres database, map columns to realistic [gofakeit](https://github.com/brianvoe/gofakeit) generators, then let faker-pg rewrite matching rows in place.
 An optional LLM (OpenAI-compatible) can auto-suggest mappings based on column names and types.
 
 ```
@@ -98,7 +98,7 @@ Fill in the PostgreSQL connection details and optional LLM configuration, then c
 |---|---|
 | `Tab` / `↑↓` | Move between fields |
 | `^F` | Load schema and open the fake-data editor |
-| `^A` | Start anonymization immediately (requires rules already configured) |
+| `^A` | Start anonymization immediately (uses configured or cached rules) |
 | `Ctrl+C` | Quit |
 
 **Schema filters** (comma-separated):
@@ -155,8 +155,8 @@ A confirmation screen is shown before touching any non-localhost host.
 | `--exclude-schemas` | _(none)_ | Comma-separated schema names to exclude |
 | `--include-tables` | _(all)_ | Comma-separated table names to include |
 | `--exclude-tables` | _(none)_ | Comma-separated table names to exclude |
-| `--batch-size` | `1000` | Rows processed per batch |
-| `--workers` | `1` | Concurrent worker goroutines |
+| `--batch-size` | `1000` | Reserved execution batch size setting |
+| `--workers` | `1` | Maximum database connections available during execution |
 | `--llm-provider` | `openai` | LLM provider (currently only `openai`-compatible) |
 | `--llm-model` | _(empty)_ | Model name, e.g. `gpt-4o-mini` |
 | `--llm-base-url` | _(empty)_ | Override API base URL (e.g. for Ollama or a proxy) |
@@ -193,7 +193,7 @@ Any OpenAI-compatible endpoint works (Ollama, Azure OpenAI, LiteLLM, etc.) via `
 
 ## Cache
 
-Mappings are persisted to `~/.faker-pg/fake-data-mapping.yml` keyed by `host/database`. On the next run against the same database the editor is pre-populated with your previous choices.
+Mappings are persisted to `~/.faker-pg/fake-data-mapping.yml` keyed by `host/database`. On the next run against the same database, the editor is pre-populated with your previous choices and `^A` can start from cached rules.
 
 ## Development
 

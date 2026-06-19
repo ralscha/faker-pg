@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -89,6 +90,15 @@ func saveCachedEntries(dsn string, entries []tuiFakeDataEntry) error {
 		persisted.Sources = make(map[string][]persistedEntry)
 	}
 	persisted.Sources[cacheKey] = encodeEntries(entries)
+	if persisted.Mappings == nil {
+		persisted.Mappings = make(map[string]map[string]string)
+	}
+	mappings := entriesToMappings(entries)
+	if len(mappings) == 0 {
+		delete(persisted.Mappings, cacheKey)
+	} else {
+		persisted.Mappings[cacheKey] = mappings
+	}
 
 	encoded, err := yaml.Marshal(persisted)
 	if err != nil {
@@ -101,6 +111,35 @@ func saveCachedEntries(dsn string, entries []tuiFakeDataEntry) error {
 		return fmt.Errorf("write cache %q: %w", path, err)
 	}
 	return nil
+}
+
+func loadCachedMappings(dsn string) (map[string]string, bool, error) {
+	cacheKey := pgDSNCacheKey(dsn)
+	if cacheKey == "" {
+		return nil, false, nil
+	}
+
+	path, err := cachePath()
+	if err != nil {
+		return nil, false, err
+	}
+	raw, err := os.ReadFile(path) //nolint:gosec // path is derived from os.UserHomeDir(), not user input
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("read cache %q: %w", path, err)
+	}
+
+	var persisted persistedMappings
+	if err := yaml.Unmarshal(raw, &persisted); err != nil {
+		return nil, false, fmt.Errorf("parse cache %q: %w", path, err)
+	}
+	mappings, ok := persisted.Mappings[cacheKey]
+	if !ok || len(mappings) == 0 {
+		return nil, false, nil
+	}
+	return cloneStringMap(mappings), true, nil
 }
 
 func saveCachedMappings(dsn string, mappings map[string]string) error {
@@ -144,6 +183,17 @@ func saveCachedMappings(dsn string, mappings map[string]string) error {
 		return fmt.Errorf("write cache %q: %w", path, err)
 	}
 	return nil
+}
+
+func entriesToMappings(entries []tuiFakeDataEntry) map[string]string {
+	mappings := make(map[string]string)
+	for _, entry := range entries {
+		if strings.TrimSpace(entry.FunctionName) == "" {
+			continue
+		}
+		mappings[entry.Selector] = buildFakeFunctionConfigFromEntry(entry)
+	}
+	return mappings
 }
 
 func encodeEntries(entries []tuiFakeDataEntry) []persistedEntry {

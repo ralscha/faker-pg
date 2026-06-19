@@ -49,6 +49,13 @@ func parseFlags() config {
 	flag.BoolVar(&verbose, "verbose", false, "verbose logging")
 	flag.Parse()
 
+	if batchSize <= 0 {
+		batchSize = 1000
+	}
+	if workers <= 0 {
+		workers = 1
+	}
+
 	return config{
 		DSN:            dsn,
 		IncludeSchemas: parseList(includeSchemas),
@@ -58,12 +65,12 @@ func parseFlags() config {
 		BatchSize:      batchSize,
 		Workers:        workers,
 		Verbose:        verbose,
-		LLM: llmConfig{
+		LLM: normalizeLLMConfig(&llmConfig{
 			Provider:  llmProvider,
 			Model:     llmModel,
 			BaseURL:   llmBaseURL,
 			APIKey:    llmAPIKey,
 			APIKeyEnv: llmAPIKeyEnv,
-		},
+		}),
 	}
 }

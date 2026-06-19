@@ -2,6 +2,7 @@ package faker
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 )
@@ -92,7 +93,7 @@ func buildPgDSN(form pgDSNForm) string {
 
 	u := &url.URL{
 		Scheme: pgSchemePostgres,
-		Host:   host + ":" + port,
+		Host:   net.JoinHostPort(host, port),
 		Path:   "/" + database,
 	}
 	if username != "" || password != "" {

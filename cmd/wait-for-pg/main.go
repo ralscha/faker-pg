@@ -24,7 +24,7 @@ func main() {
 
 	ticker := time.NewTicker(time.Second)
 
-	fmt.Fprintf(os.Stderr, "Waiting for PostgreSQL at %s (timeout %s)…\n", *dsn, *timeout)
+	fmt.Fprintf(os.Stderr, "Waiting for PostgreSQL at %s (timeout %s)...\n", *dsn, *timeout)
 
 	for {
 		conn, err := pgx.Connect(ctx, *dsn)

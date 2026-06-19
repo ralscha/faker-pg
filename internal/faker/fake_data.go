@@ -256,6 +256,19 @@ func supportedFakeValue(value any) bool {
 	}
 }
 
+func supportedFakeOutput(output string) bool {
+	switch output {
+	case "string", "[]string", "[]byte", "byte", "net.IP", "bool", "time", "time.Time",
+		dtInt, dtInt8, "int16", "int32", "int64",
+		"uint", "uint8", "uint16", "uint32", "uint64",
+		"float", "float32", "float64",
+		"[]int", "[]uint":
+		return true
+	default:
+		return false
+	}
+}
+
 func (f *dataFaker) fakeValue(faker *gofakeit.Faker, table tableMeta, col columnMeta) (any, bool, error) {
 	if f == nil {
 		return nil, false, nil
@@ -337,7 +350,10 @@ func availableFakeFunctionOptions() []fakeFunctionOption {
 	var options []fakeFunctionOption
 	for name, info := range gofakeit.FuncLookups {
 		sample, err := info.Generate(probe, nil, &info)
-		if err != nil || !supportedFakeValue(sample) {
+		if err != nil && (len(info.Params) == 0 || !supportedFakeOutput(info.Output)) {
+			continue
+		}
+		if err == nil && !supportedFakeValue(sample) {
 			continue
 		}
 		opt := fakeFunctionOption{

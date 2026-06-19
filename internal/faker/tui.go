@@ -101,16 +101,16 @@ func newTUIModel(cfg config) tuiModel {
 		{pgSchemePostgres, ""},
 		{"", ""},
 		{pgDefaultSSLMode, pgDefaultSSLMode},
-		{"public,app", ""},
-		{"pg_catalog,information_schema", ""},
-		{"", ""},
-		{"", ""},
+		{"public,app", strings.Join(cfg.IncludeSchemas, ",")},
+		{"pg_catalog,information_schema", strings.Join(cfg.ExcludeSchemas, ",")},
+		{"", strings.Join(cfg.IncludeTables, ",")},
+		{"", strings.Join(cfg.ExcludeTables, ",")},
 		{llmProviderOpenAI, cfg.LLM.Provider},
 		{"gpt-5.4-mini", cfg.LLM.Model},
 		{"https://api.openai.com/v1", cfg.LLM.BaseURL},
 		{"", cfg.LLM.APIKey},
 		{"OPENAI_API_KEY", cfg.LLM.APIKeyEnv},
-		{"1000", "1000"},
+		{"1000", fmt.Sprintf("%d", max(1, cfg.BatchSize))},
 		{"1", fmt.Sprintf("%d", max(1, cfg.Workers))},
 	}
 	for i, f := range fields {
@@ -666,6 +666,15 @@ func (m tuiModel) handleFormEnter() (tea.Model, tea.Cmd) {
 
 	if m.formAction == 2 {
 		if len(cfg.FakeData) == 0 {
+			if cached, found, err := loadCachedMappings(cfg.DSN); err != nil {
+				m.status = err.Error()
+				return m, nil
+			} else if found {
+				cfg.FakeData = cached
+				m.cfg.FakeData = cached
+			}
+		}
+		if len(cfg.FakeData) == 0 {
 			m.status = "No fake data rules configured. Edit fake data first."
 			return m, nil
 		}
@@ -745,14 +754,7 @@ func (m *tuiModel) configFromForm() (config, error) {
 }
 
 func (m *tuiModel) syncFakeDataIntoConfig() {
-	mappings := make(map[string]string)
-	for _, entry := range m.fakeDataEntries {
-		if strings.TrimSpace(entry.FunctionName) == "" {
-			continue
-		}
-		mappings[entry.Selector] = buildFakeFunctionConfigFromEntry(entry)
-	}
-	m.cfg.FakeData = mappings
+	m.cfg.FakeData = entriesToMappings(m.fakeDataEntries)
 }
 
 func (m tuiModel) updateFakeData(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -1008,6 +1010,13 @@ func loadSchemaCmd(cfg config) tea.Cmd {
 				}
 			}
 		}
+		mappings := cfg.FakeData
+		if len(mappings) == 0 {
+			if cachedMappings, found, err := loadCachedMappings(cfg.DSN); err == nil && found {
+				mappings = cachedMappings
+			}
+		}
+		applyMappingsToEntries(entries, mappings, availableFakeFunctionOptions())
 
 		return schemaLoadedMsg{tables: tables, entries: entries}
 	}
@@ -1017,6 +1026,34 @@ func autoSelectCmd(llmCfg llmConfig, entries []tuiFakeDataEntry, options []fakeF
 	return func() tea.Msg {
 		selections, err := autoSelectFakeDataWithLLM(context.Background(), llmCfg, entries, options)
 		return autoSelectDoneMsg{selections: selections, err: err}
+	}
+}
+
+func applyMappingsToEntries(entries []tuiFakeDataEntry, mappings map[string]string, options []fakeFunctionOption) {
+	if len(mappings) == 0 {
+		return
+	}
+	byName := make(map[string]fakeFunctionOption, len(options))
+	for _, option := range options {
+		byName[option.LookupName] = option
+	}
+	for i := range entries {
+		raw, ok := mappings[entries[i].Selector]
+		if !ok {
+			continue
+		}
+		functionName, params := parseFakeFunctionConfig(raw)
+		lookupName, _ := resolveFakeFunction(functionName)
+		if lookupName == "" {
+			continue
+		}
+		option, ok := byName[lookupName]
+		if !ok {
+			continue
+		}
+		entries[i].FunctionName = option.LookupName
+		entries[i].FunctionDisplay = option.Display
+		entries[i].FunctionParams = append([]string(nil), params...)
 	}
 }
 
