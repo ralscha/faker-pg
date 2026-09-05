@@ -9,17 +9,15 @@ tasks:
   format:
     desc: Format Go code
     cmds:
-      - go fix ./...
       - go fmt ./...
 
   build:
     desc: Build the faker-pg binary
-    deps: [format]
     cmds:
       - go build ./cmd/faker-pg
 
   lint:
-    desc: Run golangci-lint in a Docker container
+    desc: Run golangci-lint
     cmds:
       - golangci-lint run -v --timeout 5m
 
@@ -36,7 +34,6 @@ tasks:
 
   run:
     desc: Launch the TUI
-    deps: [build]
     summary: |
       Open the TUI, optionally preloading the DSN from a command-line flag.
 
@@ -78,12 +75,13 @@ tasks:
         postgres://postgres:postgres@localhost:5432/devdb?sslmode=disable
     cmds:
       - go run ./cmd/wait-for-pg -dsn "postgres://postgres:postgres@localhost:5432/devdb?sslmode=disable" -timeout 30s
-      - cmd /c "docker exec -i faker-pg-dev psql -U postgres -d devdb < demo\demo_schema.sql"
+      - docker cp demo/demo_schema.sql faker-pg-dev:/tmp/faker-pg-demo-schema.sql
+      - docker exec faker-pg-dev psql -U postgres -d devdb -f /tmp/faker-pg-demo-schema.sql
 
   demo:teardown:
     desc: Drop the demo schema only (keeps the container)
     cmds:
-      - cmd /c "echo DROP SCHEMA IF EXISTS demo CASCADE; | docker exec -i faker-pg-dev psql -U postgres -d devdb"
+      - docker exec faker-pg-dev psql -U postgres -d devdb -c "DROP SCHEMA IF EXISTS demo CASCADE;"
 
   demo:run:
     desc: Launch faker-pg TUI against the demo schema
@@ -99,7 +97,10 @@ tasks:
   clean:
     desc: Remove the built executable if present
     cmds:
-      - cmd /c "if exist faker-pg.exe del /q faker-pg.exe"
+      - cmd: rm -f faker-pg
+        platforms: [linux, darwin]
+      - cmd: powershell -NoProfile -Command "Remove-Item -LiteralPath './faker-pg.exe' -Force -ErrorAction SilentlyContinue"
+        platforms: [windows]
 
   tag:
     desc: Create a local git tag for a release

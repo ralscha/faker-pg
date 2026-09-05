@@ -3,16 +3,14 @@ package faker
 import (
 	"context"
 	"fmt"
-	"math"
+	"strconv"
 	"strings"
-	"sync"
 
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/table"
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
-	"github.com/brianvoe/gofakeit/v7"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -33,7 +31,6 @@ const (
 const formFieldCount = 17
 
 type schemaLoadedMsg struct {
-	tables  []tableMeta
 	entries []tuiFakeDataEntry
 	err     error
 }
@@ -49,8 +46,6 @@ type executionDoneMsg struct {
 	logLines   []string
 	err        error
 }
-
-var tuiExecutionMu sync.Mutex
 
 type tuiModel struct {
 	cfg    config
@@ -68,7 +63,6 @@ type tuiModel struct {
 	paramOption fakeFunctionOption
 
 	fakeDataEntries []tuiFakeDataEntry
-	tables          []tableMeta
 	fakeFunctions   []fakeFunctionOption
 	spinner         spinner.Model
 	status          string
@@ -124,6 +118,8 @@ func newTUIModel(cfg config) tuiModel {
 
 	inputs[4].EchoMode = textinput.EchoPassword
 	inputs[4].EchoCharacter = rune(8226)
+	inputs[13].EchoMode = textinput.EchoPassword
+	inputs[13].EchoCharacter = rune(8226)
 
 	focusedStyle := textinput.DefaultStyles(true)
 	focusedStyle.Focused.Prompt = lipgloss.NewStyle().Foreground(colorPrimary).Bold(true)
@@ -202,8 +198,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.fakeDataTable.SetWidth(msg.Width - 4)
-		m.fakeDataTable.SetHeight(msg.Height - 12)
+		m.fakeDataTable.SetWidth(max(1, msg.Width-4))
+		m.fakeDataTable.SetHeight(max(1, msg.Height-12))
 		return m, nil
 
 	case spinner.TickMsg:
@@ -217,7 +213,6 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = msg.err.Error()
 			return m, nil
 		}
-		m.tables = msg.tables
 		m.screen = tuiScreenFakeData
 		m.fakeDataEntries = msg.entries
 		m.rebuildFakeDataTable()
@@ -366,7 +361,9 @@ func (m tuiModel) statusView() string {
 	if strings.TrimSpace(m.status) == "" {
 		return statusStyle.Render("  Status: ready")
 	}
-	if strings.Contains(m.status, "failed") || strings.Contains(m.status, "Error") || strings.Contains(m.status, "required") {
+	lowerStatus := strings.ToLower(m.status)
+	if strings.Contains(lowerStatus, "fail") || strings.Contains(lowerStatus, "error") ||
+		strings.Contains(lowerStatus, "required") || strings.Contains(lowerStatus, "invalid") {
 		return statusErrStyle.Render("  Status: " + m.status)
 	}
 	return statusOKStyle.Render("  Status: " + m.status)
@@ -411,7 +408,7 @@ func (m tuiModel) formView() string {
 	b.WriteString(m.formRow("Batch size", m.formInputs[15]))
 	b.WriteString(m.formRow("Workers", m.formInputs[16]))
 
-	fakeCount := countExactFakeDataRules(m.cfg.FakeData)
+	fakeCount := len(m.cfg.FakeData)
 	editLabel := fmt.Sprintf("[^F] Edit fake data (%d rules)", fakeCount)
 	startLabel := "[^A] Start anonymization"
 	editBtn := buttonStyle.Render(editLabel)
@@ -465,9 +462,13 @@ func (m tuiModel) fakerPickerView() string {
 	b.WriteString("\n\n")
 
 	filtered := m.filteredFakeFunctions()
-	end := min(m.visibleRows(), len(filtered))
+	start, end := visiblePickerRange(m.pickerCursor, len(filtered), m.visibleRows())
+	if start > 0 {
+		more := lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("... %d earlier functions", start))
+		fmt.Fprintf(&b, "  %s\n", more)
+	}
 
-	for i := range end {
+	for i := start; i < end; i++ {
 		opt := filtered[i]
 		cursor := "  "
 		if i == m.pickerCursor {
@@ -500,9 +501,9 @@ func (m tuiModel) fakerParamsView() string {
 	}
 
 	b.WriteString("\n")
-	fmt.Fprintf(&b, "  Value: %s\n", m.paramInput.View())
+	fmt.Fprintf(&b, "  Values (; separated): %s\n", m.paramInput.View())
 	b.WriteString("\n")
-	b.WriteString(helpStyle.Render("  Type the parameter value and press enter. Press esc to skip."))
+	b.WriteString(helpStyle.Render("  Enter values in the order shown, separated by ';'. Press esc to cancel."))
 	return b.String()
 }
 
@@ -522,6 +523,15 @@ func (m tuiModel) confirmRemoteView() string {
 
 func (m tuiModel) visibleRows() int {
 	return max(8, m.height-12)
+}
+
+func visiblePickerRange(cursor, total, visible int) (int, int) {
+	if total <= 0 || visible <= 0 {
+		return 0, 0
+	}
+	cursor = min(max(0, cursor), total-1)
+	start := max(0, cursor-visible+1)
+	return start, min(start+visible, total)
 }
 
 func (m tuiModel) pickerTarget() int {
@@ -544,22 +554,16 @@ func (m *tuiModel) rebuildFakeDataTable() {
 }
 
 func (m tuiModel) filteredFakeFunctions() []fakeFunctionOption {
-	var allowedOutputs map[string]bool
+	typeName := ""
 	target := m.pickerTarget()
 	if target >= 0 && target < len(m.fakeDataEntries) {
-		outputs := matchingOutputTypes(m.fakeDataEntries[target].TypeName)
-		if len(outputs) > 0 {
-			allowedOutputs = make(map[string]bool, len(outputs))
-			for _, o := range outputs {
-				allowedOutputs[o] = true
-			}
-		}
+		typeName = m.fakeDataEntries[target].TypeName
 	}
 
 	query := strings.ToLower(m.pickerInput.Value())
 	var filtered []fakeFunctionOption
 	for _, opt := range m.fakeFunctions {
-		if allowedOutputs != nil && !allowedOutputs[opt.Output] {
+		if !fakeFunctionCompatible(typeName, opt.LookupName, opt.Output) {
 			continue
 		}
 		if query == "" || strings.Contains(opt.SearchText, query) {
@@ -687,7 +691,7 @@ func (m tuiModel) handleFormEnter() (tea.Model, tea.Cmd) {
 		m.runInProgress = true
 		m.screen = tuiScreenExecuting
 		m.status = "Starting anonymization..."
-		return m, executeAnonymizationCmd(cfg, m.tables)
+		return m, executeAnonymizationCmd(cfg)
 	}
 
 	m.screen = tuiScreenLoadingSchema
@@ -706,13 +710,13 @@ func (m *tuiModel) configFromForm() (config, error) {
 	}
 
 	form := pgDSNForm{
-
 		Host:     host,
 		Port:     strings.TrimSpace(m.formInputs[1].Value()),
 		Database: db,
 		Username: strings.TrimSpace(m.formInputs[3].Value()),
-		Password: strings.TrimSpace(m.formInputs[4].Value()),
+		Password: m.formInputs[4].Value(),
 		SSLMode:  strings.TrimSpace(m.formInputs[5].Value()),
+		Options:  parsePgDSNForm(m.cfg.DSN).Options,
 	}
 	dsn := buildPgDSN(form)
 
@@ -730,22 +734,25 @@ func (m *tuiModel) configFromForm() (config, error) {
 			APIKey:    strings.TrimSpace(m.formInputs[13].Value()),
 			APIKeyEnv: strings.TrimSpace(m.formInputs[14].Value()),
 		},
+		Verbose: m.cfg.Verbose,
 	}
 	cfg.LLM = normalizeLLMConfig(&cfg.LLM)
 
 	if bs := strings.TrimSpace(m.formInputs[15].Value()); bs != "" {
-		var n int
-		if _, err := fmt.Sscanf(bs, "%d", &n); err == nil && n > 0 {
-			cfg.BatchSize = n
+		n, err := parsePositiveInt("batch size", bs)
+		if err != nil {
+			return config{}, err
 		}
+		cfg.BatchSize = n
 	}
 
 	cfg.Workers = 1
 	if ws := strings.TrimSpace(m.formInputs[16].Value()); ws != "" {
-		var n int
-		if _, err := fmt.Sscanf(ws, "%d", &n); err == nil && n > 0 {
-			cfg.Workers = n
+		n, err := parsePositiveInt("workers", ws)
+		if err != nil {
+			return config{}, err
 		}
+		cfg.Workers = n
 	}
 
 	cfg.FakeData = m.cfg.FakeData
@@ -843,11 +850,6 @@ func (m tuiModel) updateFakerPicker(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			selected := filtered[m.pickerCursor]
 			target := m.pickerTarget()
 			if target >= 0 && target < len(m.fakeDataEntries) {
-				entry := &m.fakeDataEntries[target]
-				entry.FunctionName = selected.LookupName
-				entry.FunctionDisplay = selected.Display
-				entry.FunctionParams = nil
-
 				if len(selected.Params) > 0 {
 					m.paramTarget = target
 					m.paramOption = selected
@@ -856,6 +858,10 @@ func (m tuiModel) updateFakerPicker(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 
+				entry := &m.fakeDataEntries[target]
+				entry.FunctionName = selected.LookupName
+				entry.FunctionDisplay = selected.Display
+				entry.FunctionParams = nil
 				m.screen = tuiScreenFakeData
 				m.syncFakeDataIntoConfig()
 				m.rebuildFakeDataTable()
@@ -878,9 +884,15 @@ func (m tuiModel) updateFakerParams(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case keyEnter:
 		entry := &m.fakeDataEntries[m.paramTarget]
-		if strings.TrimSpace(m.paramInput.Value()) != "" {
-			entry.FunctionParams = []string{m.paramInput.Value()}
+		params := parseParameterValues(m.paramInput.Value())
+		functionConfig := buildFakeFunctionConfig(m.paramOption.LookupName, params)
+		if _, _, err := compileFakeDataRule(entry.Selector, functionConfig); err != nil {
+			m.status = "Invalid parameters: " + err.Error()
+			return m, nil
 		}
+		entry.FunctionName = m.paramOption.LookupName
+		entry.FunctionDisplay = m.paramOption.Display
+		entry.FunctionParams = params
 		m.screen = tuiScreenFakeData
 		m.syncFakeDataIntoConfig()
 		m.rebuildFakeDataTable()
@@ -899,7 +911,7 @@ func (m tuiModel) updateConfirmRemote(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 		m.runInProgress = true
 		m.screen = tuiScreenExecuting
 		m.status = "Starting anonymization..."
-		return m, executeAnonymizationCmd(m.pendingFakeCfg, m.tables)
+		return m, executeAnonymizationCmd(m.pendingFakeCfg)
 	case "n", keyEsc:
 		m.screen = tuiScreenForm
 		m.pendingFakeCfg = config{}
@@ -991,13 +1003,17 @@ func loadSchemaCmd(cfg config) tea.Cmd {
 				entry := tuiFakeDataEntry{
 					Selector: selector,
 					Display:  tbl.Schema + "." + tbl.Name + "." + col.Name,
-					TypeName: col.DataType,
+					TypeName: fakerTypeName(col),
 				}
 				entries = append(entries, entry)
 			}
 		}
 
-		if cached, found, err := loadCachedEntries(cfg.DSN); err == nil && found && len(cached) > 0 {
+		cached, found, err := loadCachedEntries(cfg.DSN)
+		if err != nil {
+			return schemaLoadedMsg{err: err}
+		}
+		if found && len(cached) > 0 {
 			cachedBySelector := make(map[string]tuiFakeDataEntry, len(cached))
 			for _, c := range cached {
 				cachedBySelector[c.Selector] = c
@@ -1012,13 +1028,19 @@ func loadSchemaCmd(cfg config) tea.Cmd {
 		}
 		mappings := cfg.FakeData
 		if len(mappings) == 0 {
-			if cachedMappings, found, err := loadCachedMappings(cfg.DSN); err == nil && found {
+			cachedMappings, found, err := loadCachedMappings(cfg.DSN)
+			if err != nil {
+				return schemaLoadedMsg{err: err}
+			}
+			if found {
 				mappings = cachedMappings
 			}
 		}
-		applyMappingsToEntries(entries, mappings, availableFakeFunctionOptions())
+		if err := applyMappingsToEntries(entries, mappings, availableFakeFunctionOptions()); err != nil {
+			return schemaLoadedMsg{err: fmt.Errorf("apply fake-data mappings: %w", err)}
+		}
 
-		return schemaLoadedMsg{tables: tables, entries: entries}
+		return schemaLoadedMsg{entries: entries}
 	}
 }
 
@@ -1029,185 +1051,71 @@ func autoSelectCmd(llmCfg llmConfig, entries []tuiFakeDataEntry, options []fakeF
 	}
 }
 
-func applyMappingsToEntries(entries []tuiFakeDataEntry, mappings map[string]string, options []fakeFunctionOption) {
+func applyMappingsToEntries(entries []tuiFakeDataEntry, mappings map[string]string, options []fakeFunctionOption) error {
 	if len(mappings) == 0 {
-		return
+		return nil
+	}
+	dataFaker, err := newDataFaker(mappings)
+	if err != nil {
+		return err
 	}
 	byName := make(map[string]fakeFunctionOption, len(options))
 	for _, option := range options {
 		byName[option.LookupName] = option
 	}
 	for i := range entries {
-		raw, ok := mappings[entries[i].Selector]
+		parts := strings.Split(entries[i].Selector, ".")
+		if len(parts) != 3 {
+			continue
+		}
+		rule, ok := dataFaker.matchRule(
+			tableMeta{Schema: parts[0], Name: parts[1]},
+			columnMeta{Name: parts[2]},
+		)
 		if !ok {
 			continue
 		}
-		functionName, params := parseFakeFunctionConfig(raw)
-		lookupName, _ := resolveFakeFunction(functionName)
-		if lookupName == "" {
-			continue
-		}
-		option, ok := byName[lookupName]
+		option, ok := byName[rule.lookupName]
 		if !ok {
 			continue
+		}
+		if !fakeFunctionCompatible(entries[i].TypeName, option.LookupName, option.Output) {
+			return fmt.Errorf(
+				"rule %q produces %s, which is incompatible with %s (%s)",
+				rule.selector, option.Output, entries[i].Display, entries[i].TypeName,
+			)
 		}
 		entries[i].FunctionName = option.LookupName
 		entries[i].FunctionDisplay = option.Display
-		entries[i].FunctionParams = append([]string(nil), params...)
+		entries[i].FunctionParams = append([]string(nil), rule.rawParams...)
 	}
+	return nil
 }
 
-func executeAnonymizationCmd(cfg config, tables []tableMeta) tea.Cmd {
+func executeAnonymizationCmd(cfg config) tea.Cmd {
 	return func() tea.Msg {
-		tuiExecutionMu.Lock()
-		defer tuiExecutionMu.Unlock()
-
-		ctx := context.Background()
-		poolCfg, err := pgxpool.ParseConfig(cfg.DSN)
-		if err != nil {
-			return executionDoneMsg{err: fmt.Errorf("parse DSN: %w", err)}
-		}
-		poolCfg.MaxConns = int32(min(max(1, cfg.Workers), math.MaxInt32)) //nolint:gosec // clamped to MaxInt32 above
-		pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
-		if err != nil {
-			return executionDoneMsg{err: fmt.Errorf("connect: %w", err)}
-		}
-		defer pool.Close()
-
-		if len(tables) == 0 {
-			tables, err = loadTables(ctx, pool, cfg.IncludeSchemas, cfg.ExcludeSchemas, cfg.IncludeTables, cfg.ExcludeTables)
-			if err != nil {
-				return executionDoneMsg{err: err}
-			}
-		}
-
-		faker, err := newDataFaker(cfg.FakeData)
-		if err != nil {
-			return executionDoneMsg{err: fmt.Errorf("init faker: %w", err)}
-		}
-
-		var logLines []string
-		totalRows := int64(0)
-		tableCount := 0
-
-		for _, tbl := range tables {
-			cols := tbl.CopyColumns()
-			if len(cols) == 0 {
-				continue
-			}
-
-			var fakedCols []columnMeta
-			for _, col := range cols {
-				if _, ok := faker.matchRule(tbl, col); ok {
-					fakedCols = append(fakedCols, col)
-				}
-			}
-			if len(fakedCols) == 0 {
-				continue
-			}
-
-			rowsAffected, err := anonymizeTable(ctx, pool, tbl, fakedCols, faker)
-			if err != nil {
-				return executionDoneMsg{err: fmt.Errorf("anonymize %s: %w", tbl.FQTN(), err), logLines: logLines}
-			}
-			totalRows += rowsAffected
-			tableCount++
-			logLines = append(logLines, fmt.Sprintf("anonymized %s: %d rows", tbl.FQTN(), rowsAffected))
-		}
-
-		if err := saveCachedMappings(cfg.DSN, cfg.FakeData); err != nil {
-			logLines = append(logLines, fmt.Sprintf("warning: failed to save cache: %v", err))
-		}
-
-		return executionDoneMsg{tableCount: tableCount, rowCount: totalRows, logLines: logLines}
+		result := runAnonymization(context.Background(), cfg)
+		return executionDoneMsg(result)
 	}
 }
 
-func anonymizeTable(ctx context.Context, pool *pgxpool.Pool, tbl tableMeta, fakedCols []columnMeta, faker *dataFaker) (int64, error) {
-	setClauses := make([]string, len(fakedCols))
-	for i, col := range fakedCols {
-		setClauses[i] = fmt.Sprintf("%q = $%d", col.Name, i+1)
+func parsePositiveInt(field, value string) (int, error) {
+	n, err := strconv.Atoi(value)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer", field)
 	}
+	return n, nil
+}
 
-	pkCols := tbl.PrimaryKeyColumns()
-	if len(pkCols) == 0 {
-		return 0, fmt.Errorf("table %s has no primary key; cannot anonymize without a PK", tbl.FQTN())
+func parseParameterValues(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
 	}
-
-	selectCols := make([]string, 0, len(pkCols)+len(fakedCols))
-	for _, pk := range pkCols {
-		selectCols = append(selectCols, fmt.Sprintf("%q", pk))
+	parts := strings.Split(value, ";")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
 	}
-	for _, col := range fakedCols {
-		selectCols = append(selectCols, fmt.Sprintf("%q", col.Name))
-	}
-
-	selectSQL := fmt.Sprintf("SELECT %s FROM %s", strings.Join(selectCols, ", "), tbl.FQTN())
-
-	whereClauses := make([]string, len(pkCols))
-	for i, pk := range pkCols {
-		whereClauses[i] = fmt.Sprintf("%q = $%d", pk, len(fakedCols)+i+1)
-	}
-	updateSQL := fmt.Sprintf("UPDATE %s SET %s WHERE %s",
-		tbl.FQTN(),
-		strings.Join(setClauses, ", "),
-		strings.Join(whereClauses, " AND "),
-	)
-
-	rows, err := pool.Query(ctx, selectSQL)
-	if err != nil {
-		return 0, fmt.Errorf("select: %w", err)
-	}
-	defer rows.Close()
-
-	gofakeitFaker := gofakeit.New(0)
-	var totalRows int64
-
-	for rows.Next() {
-		scanTargets := make([]any, len(pkCols)+len(fakedCols))
-		pkValues := make([]any, len(pkCols))
-		fakeTargets := make([]any, len(fakedCols))
-
-		for i := range pkValues {
-			scanTargets[i] = &pkValues[i]
-		}
-		for i := range fakeTargets {
-			scanTargets[len(pkCols)+i] = &fakeTargets[i]
-		}
-
-		if err := rows.Scan(scanTargets...); err != nil {
-			return 0, fmt.Errorf("scan: %w", err)
-		}
-
-		updateArgs := make([]any, len(fakedCols)+len(pkCols))
-		for i, col := range fakedCols {
-			fakeVal, ok, err := faker.fakeValue(gofakeitFaker, tbl, col)
-			if err != nil {
-				return 0, fmt.Errorf("generate fake for %s.%s: %w", tbl.FQTN(), col.Name, err)
-			}
-			if !ok {
-				updateArgs[i] = nil
-				continue
-			}
-			coerced := replaceValue(col, fakeVal)
-			updateArgs[i] = coerced
-		}
-
-		for i, pkVal := range pkValues {
-			updateArgs[len(fakedCols)+i] = pkVal
-		}
-
-		if _, err := pool.Exec(ctx, updateSQL, updateArgs...); err != nil {
-			return 0, fmt.Errorf("update: %w", err)
-		}
-		totalRows++
-	}
-
-	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("iterate: %w", err)
-	}
-
-	return totalRows, nil
+	return parts
 }
 
 func (t tableMeta) CopyColumns() []columnMeta {

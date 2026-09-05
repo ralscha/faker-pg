@@ -2,6 +2,8 @@ package faker
 
 import (
 	"net/url"
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -18,8 +20,45 @@ func TestBuildPgDSNRoundTrip(t *testing.T) {
 	dsn := buildPgDSN(form)
 	parsed := parsePgDSNForm(dsn)
 
-	if parsed != form {
+	if !reflect.DeepEqual(parsed, form) {
 		t.Fatalf("parsed DSN mismatch:\n got: %#v\nwant: %#v\nraw:  %s", parsed, form, dsn)
+	}
+}
+
+func TestBuildPgDSNPreservesPasswordWhitespace(t *testing.T) {
+	form := pgDSNForm{Host: "localhost", Database: "app", Username: "user", Password: " secret "}
+	parsed := parsePgDSNForm(buildPgDSN(form))
+	if parsed.Password != form.Password {
+		t.Fatalf("password whitespace was changed: got %q", parsed.Password)
+	}
+}
+
+func TestPgDSNPreservesConnectionOptions(t *testing.T) {
+	input := "postgres://user:pass@db.example.com:5432/app?sslmode=verify-full&application_name=faker-pg&connect_timeout=10" //nolint:gosec // synthetic test DSN
+	parsed := parsePgDSNForm(input)
+	if parsed.Options.Get("application_name") != "faker-pg" || parsed.Options.Get("connect_timeout") != "10" {
+		t.Fatalf("parsed options = %#v", parsed.Options)
+	}
+	built := buildPgDSN(parsed)
+	u, err := url.Parse(built)
+	if err != nil {
+		t.Fatalf("parse rebuilt DSN: %v", err)
+	}
+	if got := u.Query().Get("sslmode"); got != "verify-full" {
+		t.Fatalf("sslmode = %q", got)
+	}
+	if got := u.Query().Get("application_name"); got != "faker-pg" {
+		t.Fatalf("application_name = %q", got)
+	}
+}
+
+func TestParsePgKeyValueDSNHandlesQuotedValues(t *testing.T) {
+	parsed := parsePgDSNForm(`host=db.example.com port=5432 dbname='my app' user=test password='p\'ass word' application_name='faker pg'`)
+	if parsed.Database != "my app" || parsed.Password != "p'ass word" {
+		t.Fatalf("parsed quoted values: %#v", parsed)
+	}
+	if got := parsed.Options.Get("application_name"); got != "faker pg" {
+		t.Fatalf("application_name = %q", got)
 	}
 }
 
@@ -36,6 +75,17 @@ func TestBuildPgDSNIPv6Host(t *testing.T) {
 	}
 	if got := u.Hostname(); got != "::1" {
 		t.Fatalf("hostname = %q, want ::1; raw DSN %s", got, dsn)
+	}
+}
+
+func TestPgDSNCacheKeyIncludesPort(t *testing.T) {
+	first := pgDSNCacheKey("postgres://localhost:5432/app")
+	second := pgDSNCacheKey("postgres://localhost:5433/app")
+	if first == second {
+		t.Fatalf("cache keys collide: %q", first)
+	}
+	if first != "localhost:5432/app" {
+		t.Fatalf("cache key = %q", first)
 	}
 }
 
@@ -105,5 +155,65 @@ func TestDataFakerRulePrecedence(t *testing.T) {
 func TestTruncateStringCountsRunes(t *testing.T) {
 	if got := truncateString("\u00e5bc\U0001f600d", 4); got != "\u00e5bc\U0001f600" {
 		t.Fatalf("truncateString counted bytes: got %q", got)
+	}
+}
+
+func TestFQTNQuotesPostgreSQLIdentifiers(t *testing.T) {
+	table := tableMeta{Schema: `odd"schema`, Name: "table name"}
+	if got, want := table.FQTN(), `"odd""schema"."table name"`; got != want {
+		t.Fatalf("FQTN() = %q, want %q", got, want)
+	}
+}
+
+func TestMarkUnsafeColumns(t *testing.T) {
+	table := tableMeta{
+		PrimaryKey:  &keyConstraint{Columns: []string{"id"}},
+		ForeignKeys: []foreignKey{{Columns: []string{"account_id"}}},
+		Referenced:  []string{"external_code"},
+		Columns: []columnMeta{
+			{Name: "id", Copyable: true},
+			{Name: "account_id", Copyable: true},
+			{Name: "email", Copyable: true},
+			{Name: "external_code", Copyable: true},
+			{Name: "payload", Copyable: false, SkipReason: "unsupported type: jsonb"},
+		},
+	}
+
+	markUnsafeColumns(&table)
+	if table.Columns[0].Copyable || !strings.Contains(table.Columns[0].SkipReason, "primary key") {
+		t.Fatalf("primary key was not protected: %#v", table.Columns[0])
+	}
+	if table.Columns[1].Copyable || !strings.Contains(table.Columns[1].SkipReason, "foreign key") {
+		t.Fatalf("foreign key was not protected: %#v", table.Columns[1])
+	}
+	if !table.Columns[2].Copyable {
+		t.Fatalf("ordinary supported column was disabled: %#v", table.Columns[2])
+	}
+	if table.Columns[3].Copyable || !strings.Contains(table.Columns[3].SkipReason, "referenced by foreign keys") {
+		t.Fatalf("referenced key was not protected: %#v", table.Columns[3])
+	}
+	if table.Columns[4].Copyable || table.Columns[4].SkipReason != "unsupported type: jsonb" {
+		t.Fatalf("existing unsupported reason was changed: %#v", table.Columns[4])
+	}
+}
+
+func TestMarkUnsafeColumnsRejectsTableWithoutPrimaryKey(t *testing.T) {
+	table := tableMeta{Columns: []columnMeta{{Name: "email", Copyable: true}}}
+	markUnsafeColumns(&table)
+	if table.Columns[0].Copyable || !strings.Contains(table.Columns[0].SkipReason, "without a primary key") {
+		t.Fatalf("column = %#v, want non-copyable no-PK reason", table.Columns[0])
+	}
+}
+
+func TestSupportedColumnType(t *testing.T) {
+	for _, typeName := range []string{"text", "int4", "numeric", "timestamptz", "uuid", "inet"} {
+		if !supportedColumnType(typeName) {
+			t.Errorf("supportedColumnType(%q) = false", typeName)
+		}
+	}
+	for _, typeName := range []string{"jsonb", "bytea", "point", "tsvector", "custom_enum"} {
+		if supportedColumnType(typeName) {
+			t.Errorf("supportedColumnType(%q) = true", typeName)
+		}
 	}
 }

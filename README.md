@@ -25,15 +25,17 @@ faker-pg -- PostgreSQL Fake Data Anonymizer
 - **Type-aware picker** — shows only generators whose output type is compatible with the target column
 - **Parameterised functions** — pass arguments to generators (e.g. `numerify` format strings)
 - **Regex selectors** — map a single rule to multiple columns via a pattern
+- **Constraint safeguards** — key columns, generated columns, and unsupported types are excluded to preserve integrity
+- **Batched parallel execution** — update rows in bounded batches and process independent tables concurrently
 - **LLM auto-select** — uses any OpenAI-compatible model to suggest mappings for sensitive columns
 - **Persistent cache** — mappings are saved to `~/.faker-pg/fake-data-mapping.yml` and restored on next run
 - **Remote host guard** — confirms before touching a non-localhost database
 
 ## Requirements
 
-- Go 1.26+
+- Go 1.27.1+
 - PostgreSQL 12+ (accessed over TCP; unix sockets are not tested)
-- _(Optional)_ Docker — for the `task dev:db:*` helpers and the linter task
+- _(Optional)_ Docker — for the `task dev:db:*` helpers
 - _(Optional)_ An OpenAI-compatible API key — for LLM auto-select
 
 ## Installation
@@ -65,6 +67,12 @@ faker-pg
 
 # Pre-fill the DSN from the command line
 faker-pg --dsn "postgres://user:pass@localhost:5432/mydb?sslmode=disable"
+
+# Supply reusable rules from the command line (the flag is repeatable)
+faker-pg \
+  --dsn "postgres://user:pass@localhost:5432/mydb?sslmode=disable" \
+  --fake-data "email=email" \
+  --fake-data 'public\..*\.phone=phonenumber'
 
 # Pre-fill the DSN and configure the LLM for auto-select
 faker-pg \
@@ -133,16 +141,17 @@ Type to filter the 600+ available gofakeit functions. Only functions whose outpu
 | `Enter` | Select the highlighted function |
 | `Esc` | Cancel |
 
-If the selected function accepts parameters, a parameter entry screen is shown next.
+If the selected function accepts parameters, a parameter entry screen is shown next. Enter multiple values in the displayed order, separated by `;`.
 
 ### 4 — Run
 
 Press `^A` from the connection form to start. faker-pg will:
 
 1. Parse the fake-data rules
-2. Connect to PostgreSQL and load the schema (if not already loaded)
-3. For each table that has at least one mapped column, issue `UPDATE` statements replacing column values with generated fakes
-4. Report the total rows and tables updated
+2. Connect to PostgreSQL and load the current schema
+3. For each table that has at least one mapped column, replace values in transactional database batches
+4. Process up to `--workers` tables concurrently
+5. Report the total rows and tables updated
 
 A confirmation screen is shown before touching any non-localhost host.
 
@@ -155,8 +164,9 @@ A confirmation screen is shown before touching any non-localhost host.
 | `--exclude-schemas` | _(none)_ | Comma-separated schema names to exclude |
 | `--include-tables` | _(all)_ | Comma-separated table names to include |
 | `--exclude-tables` | _(none)_ | Comma-separated table names to exclude |
-| `--batch-size` | `1000` | Reserved execution batch size setting |
-| `--workers` | `1` | Maximum database connections available during execution |
+| `--fake-data` | _(none)_ | Repeatable `selector=function[;parameter...]` rule |
+| `--batch-size` | `1000` | Rows sent in each database update batch |
+| `--workers` | `1` | Maximum number of tables processed concurrently |
 | `--llm-provider` | `openai` | LLM provider (currently only `openai`-compatible) |
 | `--llm-model` | _(empty)_ | Model name, e.g. `gpt-4o-mini` |
 | `--llm-base-url` | _(empty)_ | Override API base URL (e.g. for Ollama or a proxy) |
@@ -176,6 +186,7 @@ Rules are matched from most to least specific:
 | Regex | `public\..*\.email` | Any column whose full name matches the pattern |
 
 Selectors are case-insensitive. Quoted identifiers (`"MyTable"`) are normalised to lower-case.
+Use `--fake-data` to configure generic and regex selectors; rules selected in the editor are stored as exact selectors.
 
 ### Function parameters
 
@@ -193,7 +204,7 @@ Any OpenAI-compatible endpoint works (Ollama, Azure OpenAI, LiteLLM, etc.) via `
 
 ## Cache
 
-Mappings are persisted to `~/.faker-pg/fake-data-mapping.yml` keyed by `host/database`. On the next run against the same database, the editor is pre-populated with your previous choices and `^A` can start from cached rules.
+Mappings are persisted to `~/.faker-pg/fake-data-mapping.yml` keyed by `host:port/database`. On the next run against the same database, the editor is pre-populated with your previous choices and `^A` can start from cached rules. Existing `host/database` cache entries remain readable.
 
 ## Development
 
@@ -207,7 +218,7 @@ task test:cover
 # Format code
 task format
 
-# Run linter (requires Docker)
+# Run linter
 task lint
 
 # Build binary

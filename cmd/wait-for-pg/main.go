@@ -16,34 +16,44 @@ import (
 )
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	dsn := flag.String("dsn", "postgres://postgres:postgres@localhost:5432/devdb?sslmode=disable", "PostgreSQL DSN")
 	timeout := flag.Duration("timeout", 30*time.Second, "max time to wait")
 	flag.Parse()
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
 
 	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 
-	fmt.Fprintf(os.Stderr, "Waiting for PostgreSQL at %s (timeout %s)...\n", *dsn, *timeout)
+	fmt.Fprintf(os.Stderr, "Waiting for PostgreSQL at %s (timeout %s)...\n", connectionLabel(*dsn), *timeout)
 
 	for {
 		conn, err := pgx.Connect(ctx, *dsn)
 		if err == nil {
-			ticker.Stop()
-			cancel()
-			_ = conn.Close(ctx)
+			_ = conn.Close(context.Background())
 			fmt.Fprintln(os.Stderr, "PostgreSQL is ready.")
-			return
+			return 0
 		}
 		fmt.Fprintf(os.Stderr, "  not ready: %v\n", err)
 
 		select {
 		case <-ctx.Done():
-			ticker.Stop()
-			cancel()
 			fmt.Fprintf(os.Stderr, "Timed out waiting for PostgreSQL: %v\n", ctx.Err())
-			os.Exit(1)
+			return 1
 		case <-ticker.C:
 		}
 	}
+}
+
+func connectionLabel(dsn string) string {
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return "the configured server"
+	}
+	return fmt.Sprintf("%s:%d/%s", cfg.Host, cfg.Port, cfg.Database)
 }

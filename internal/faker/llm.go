@@ -119,13 +119,13 @@ func autoSelectFakeDataWithLLM(ctx context.Context, llmCfg llmConfig, entries []
 		return nil, fmt.Errorf("parse llm faker suggestions: %w", err)
 	}
 
-	allowedSet := make(map[string]struct{}, len(allowed))
+	allowedByName := make(map[string]fakeFunctionOption, len(allowed))
 	for _, option := range allowed {
-		allowedSet[option.LookupName] = struct{}{}
+		allowedByName[option.LookupName] = option
 	}
-	entrySet := make(map[string]struct{}, len(entries))
+	entriesBySelector := make(map[string]tuiFakeDataEntry, len(entries))
 	for _, entry := range entries {
-		entrySet[entry.Selector] = struct{}{}
+		entriesBySelector[normalizeFilterName(entry.Selector)] = entry
 	}
 
 	filtered := make(map[string]string, len(decoded))
@@ -135,10 +135,12 @@ func autoSelectFakeDataWithLLM(ctx context.Context, llmCfg llmConfig, entries []
 		if selector == "" || functionName == "" {
 			continue
 		}
-		if _, ok := entrySet[selector]; !ok {
+		entry, ok := entriesBySelector[selector]
+		if !ok {
 			continue
 		}
-		if _, ok := allowedSet[functionName]; !ok {
+		option, ok := allowedByName[functionName]
+		if !ok || !fakeFunctionCompatible(entry.TypeName, option.LookupName, option.Output) {
 			continue
 		}
 		filtered[selector] = functionName

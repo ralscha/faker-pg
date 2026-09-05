@@ -58,11 +58,12 @@ func loadCachedEntries(dsn string) ([]tuiFakeDataEntry, bool, error) {
 	if err := yaml.Unmarshal(raw, &persisted); err != nil {
 		return nil, false, fmt.Errorf("parse cache %q: %w", path, err)
 	}
-	entries, ok := persisted.Sources[cacheKey]
-	if !ok {
-		return nil, false, nil
+	for _, key := range pgDSNCacheKeys(dsn) {
+		if entries, ok := persisted.Sources[key]; ok {
+			return decodeEntries(entries), true, nil
+		}
 	}
-	return decodeEntries(entries), true, nil
+	return nil, false, nil
 }
 
 func saveCachedEntries(dsn string, entries []tuiFakeDataEntry) error {
@@ -135,11 +136,12 @@ func loadCachedMappings(dsn string) (map[string]string, bool, error) {
 	if err := yaml.Unmarshal(raw, &persisted); err != nil {
 		return nil, false, fmt.Errorf("parse cache %q: %w", path, err)
 	}
-	mappings, ok := persisted.Mappings[cacheKey]
-	if !ok || len(mappings) == 0 {
-		return nil, false, nil
+	for _, key := range pgDSNCacheKeys(dsn) {
+		if mappings, ok := persisted.Mappings[key]; ok && len(mappings) > 0 {
+			return cloneStringMap(mappings), true, nil
+		}
 	}
-	return cloneStringMap(mappings), true, nil
+	return nil, false, nil
 }
 
 func saveCachedMappings(dsn string, mappings map[string]string) error {

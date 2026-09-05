@@ -24,6 +24,7 @@ type fakeDataRule struct {
 	lookupName   string
 	info         gofakeit.Info
 	params       gofakeit.MapParams
+	rawParams    []string
 	regex        *regexp.Regexp
 }
 
@@ -97,6 +98,7 @@ func compileFakeDataRule(selector string, functionConfig string) (fakeDataRule, 
 		lookupName:   lookupName,
 		info:         *info,
 		params:       params,
+		rawParams:    append([]string(nil), rawParams...),
 	}
 
 	if target, normalized, ok := exactFakeDataTarget(selector); ok {
@@ -314,15 +316,23 @@ func matchingOutputTypes(dataType string) []string {
 	dt := strings.ToLower(dataType)
 
 	if strings.Contains(dt, "char") || strings.Contains(dt, "text") ||
-		dt == dtName || dt == dtUUID {
+		dt == dtName || dt == "citext" {
 		return []string{"string", "[]string", "[]byte", "byte", "net.IP"}
+	}
+	if dt == dtUUID {
+		return []string{"string"}
+	}
+	if dt == "inet" || dt == "cidr" {
+		return []string{"string", "net.IP"}
+	}
+	if dt == "macaddr" || dt == "macaddr8" {
+		return []string{"string"}
 	}
 
 	if dt == "integer" || dt == dtInt || dt == "bigint" || dt == "smallint" ||
 		dt == "int2" || dt == "int4" || dt == dtInt8 || strings.Contains(dt, "serial") {
 		return []string{dtInt, dtInt8, "int16", "int32", "int64",
-			"uint", "uint8", "uint16", "uint32", "uint64",
-			"[]int", "[]uint"}
+			"uint", "uint8", "uint16", "uint32", "uint64"}
 	}
 
 	if strings.Contains(dt, "float") || strings.Contains(dt, "double") ||
@@ -343,6 +353,29 @@ func matchingOutputTypes(dataType string) []string {
 	}
 
 	return nil
+}
+
+func fakeFunctionCompatible(dataType, lookupName, output string) bool {
+	if !slices.Contains(matchingOutputTypes(dataType), output) {
+		return false
+	}
+	switch strings.ToLower(dataType) {
+	case dtUUID:
+		return lookupName == dtUUID
+	case "inet", "cidr":
+		return lookupName == "ipv4address" || lookupName == "ipv6address"
+	case "macaddr", "macaddr8":
+		return lookupName == "macaddress"
+	default:
+		return true
+	}
+}
+
+func fakerTypeName(column columnMeta) string {
+	if len(matchingOutputTypes(column.DataType)) > 0 {
+		return column.DataType
+	}
+	return column.UDTName
 }
 
 func availableFakeFunctionOptions() []fakeFunctionOption {
@@ -383,16 +416,6 @@ func availableFakeFunctionOptions() []fakeFunctionOption {
 
 func buildFakeFunctionConfigFromEntry(entry tuiFakeDataEntry) string {
 	return buildFakeFunctionConfig(entry.FunctionName, entry.FunctionParams)
-}
-
-func countExactFakeDataRules(mappings map[string]string) int {
-	count := 0
-	for selector := range mappings {
-		if _, _, ok := exactFakeDataTarget(selector); ok {
-			count++
-		}
-	}
-	return count
 }
 
 func replaceValue(col columnMeta, fakeValue any) any {

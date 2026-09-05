@@ -1,6 +1,10 @@
 package faker
 
-import "fmt"
+import (
+	"net/url"
+
+	"github.com/jackc/pgx/v5"
+)
 
 type tableMeta struct {
 	Schema      string
@@ -8,10 +12,11 @@ type tableMeta struct {
 	Columns     []columnMeta
 	PrimaryKey  *keyConstraint
 	ForeignKeys []foreignKey
+	Referenced  []string
 }
 
 func (t tableMeta) FQTN() string {
-	return fmt.Sprintf("%q.%q", t.Schema, t.Name)
+	return pgx.Identifier{t.Schema, t.Name}.Sanitize()
 }
 
 type columnMeta struct {
@@ -24,6 +29,7 @@ type columnMeta struct {
 	Nullable   bool
 	IsArray    bool
 	OrdinalPos int
+	Generated  bool
 	Copyable   bool
 	SkipReason string
 }
@@ -50,6 +56,7 @@ type pgDSNForm struct {
 	Username string
 	Password string
 	SSLMode  string
+	Options  url.Values
 }
 
 type config struct {

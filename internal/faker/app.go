@@ -2,7 +2,9 @@ package faker
 
 import (
 	"flag"
+	"fmt"
 	"log"
+	"strings"
 )
 
 func Main() {
@@ -32,6 +34,7 @@ func parseFlags() config {
 		batchSize      int
 		workers        int
 		verbose        bool
+		fakeData       fakeDataFlags
 	)
 
 	flag.StringVar(&dsn, "dsn", "", "PostgreSQL DSN (postgres://user:pass@host:port/db?sslmode=disable)")
@@ -47,6 +50,7 @@ func parseFlags() config {
 	flag.IntVar(&batchSize, "batch-size", 1000, "batch size for updates")
 	flag.IntVar(&workers, "workers", 1, "number of concurrent workers")
 	flag.BoolVar(&verbose, "verbose", false, "verbose logging")
+	flag.Var(&fakeData, "fake-data", "fake-data rule in selector=function[;parameter...] form (repeatable)")
 	flag.Parse()
 
 	if batchSize <= 0 {
@@ -62,6 +66,7 @@ func parseFlags() config {
 		ExcludeSchemas: parseList(excludeSchemas),
 		IncludeTables:  parseList(includeTables),
 		ExcludeTables:  parseList(excludeTables),
+		FakeData:       cloneStringMap(fakeData),
 		BatchSize:      batchSize,
 		Workers:        workers,
 		Verbose:        verbose,
@@ -73,4 +78,30 @@ func parseFlags() config {
 			APIKeyEnv: llmAPIKeyEnv,
 		}),
 	}
+}
+
+type fakeDataFlags map[string]string
+
+func (f *fakeDataFlags) String() string {
+	if f == nil || len(*f) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d configured rule(s)", len(*f))
+}
+
+func (f *fakeDataFlags) Set(value string) error {
+	selector, functionConfig, ok := strings.Cut(value, "=")
+	selector = strings.TrimSpace(selector)
+	functionConfig = strings.TrimSpace(functionConfig)
+	if !ok || selector == "" || functionConfig == "" {
+		return fmt.Errorf("fake-data rule must use selector=function[;parameter...] syntax")
+	}
+	if _, _, err := compileFakeDataRule(selector, functionConfig); err != nil {
+		return err
+	}
+	if *f == nil {
+		*f = make(fakeDataFlags)
+	}
+	(*f)[selector] = functionConfig
+	return nil
 }
