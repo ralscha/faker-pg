@@ -130,9 +130,7 @@ func executeAnonymizationJobs(
 
 	var wg sync.WaitGroup
 	for range min(max(1, workers), len(jobs)) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for job := range jobQueue {
 				if workerCtx.Err() != nil {
 					return
@@ -144,7 +142,7 @@ func executeAnonymizationJobs(
 					return
 				}
 			}
-		}()
+		})
 	}
 
 	wg.Wait()
