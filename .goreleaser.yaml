@@ -6,6 +6,8 @@ builds:
   - id: faker-pg
     main: ./cmd/faker-pg
     binary: faker-pg
+    ldflags:
+      - -s -w -X github.com/ralscha/faker-pg/internal/faker.version={{.Version}}
     env:
       - CGO_ENABLED=0
     goos:

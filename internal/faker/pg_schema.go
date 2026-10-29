@@ -14,8 +14,11 @@ func loadTables(ctx context.Context, db *pgxpool.Pool, includeSchemas, excludeSc
 	const tablesSQL = `
 SELECT
     t.table_schema,
-    t.table_name
+    t.table_name,
+    c.relkind = 'p'
 FROM information_schema.tables t
+JOIN pg_catalog.pg_namespace n ON n.nspname = t.table_schema
+JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = t.table_name
 WHERE t.table_type = 'BASE TABLE'
   AND t.table_schema NOT IN ('pg_catalog', 'information_schema')
 ORDER BY t.table_schema, t.table_name;`
@@ -34,10 +37,19 @@ ORDER BY t.table_schema, t.table_name;`
 	var tables []tableMeta
 	for rows.Next() {
 		var table tableMeta
-		if err := rows.Scan(&table.Schema, &table.Name); err != nil {
+		var partitioned bool
+		if err := rows.Scan(&table.Schema, &table.Name, &partitioned); err != nil {
 			return nil, fmt.Errorf("scan table: %w", err)
 		}
 		if !shouldIncludeTable(table.Schema, table.Name, iSchemas, eSchemas, iTables, eTables) {
+			continue
+		}
+		// Partitioned roots have no storage. Processing their leaf tables
+		// separately makes table filters and per-column rules unambiguous.
+		if partitioned {
+			if len(iTables) > 0 {
+				return nil, fmt.Errorf("%s is a partitioned table; include its leaf partitions instead", table.FQTN())
+			}
 			continue
 		}
 		tables = append(tables, table)
@@ -177,22 +189,16 @@ ORDER BY c.ordinal_position;`
 func loadPrimaryKey(ctx context.Context, db *pgxpool.Pool, schema, table string) (*keyConstraint, error) {
 	const pkSQL = `
 SELECT
-    tc.constraint_name,
-    array_agg(kcu.column_name ORDER BY kcu.ordinal_position)
-FROM information_schema.table_constraints tc
-JOIN information_schema.key_column_usage kcu
-    ON tc.constraint_catalog = kcu.constraint_catalog
-    AND tc.constraint_schema = kcu.constraint_schema
-    AND tc.constraint_name = kcu.constraint_name
-    AND tc.table_schema = kcu.table_schema
-    AND tc.table_name = kcu.table_name
-WHERE tc.constraint_type = 'PRIMARY KEY'
-    AND tc.table_schema = $1
-    AND tc.table_name = $2
-GROUP BY tc.constraint_name;`
+    c.conname,
+    array_agg(a.attname ORDER BY k.ordinality)
+FROM pg_catalog.pg_constraint c
+CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY k(attnum, ordinality)
+JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+WHERE c.contype = 'p' AND c.conrelid = $1::pg_catalog.regclass
+GROUP BY c.oid, c.conname;`
 
 	var pk keyConstraint
-	err := db.QueryRow(ctx, pkSQL, schema, table).Scan(&pk.Name, &pk.Columns)
+	err := db.QueryRow(ctx, pkSQL, pgx.Identifier{schema, table}.Sanitize()).Scan(&pk.Name, &pk.Columns)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -203,30 +209,33 @@ GROUP BY tc.constraint_name;`
 }
 
 func loadForeignKeys(ctx context.Context, db *pgxpool.Pool, schema, table string) ([]foreignKey, error) {
+	// PostgreSQL permits duplicate constraint names across tables, and foreign
+	// keys may reference a standalone unique index. Catalog OIDs cover both
+	// cases without ambiguous information_schema constraint-name joins.
 	const fkSQL = `
 SELECT
-    rc.constraint_name,
-    array_agg(fk.column_name ORDER BY fk.ordinal_position),
-    pk.table_schema,
-    pk.table_name,
-    array_agg(pk.column_name ORDER BY fk.ordinal_position),
-    rc.delete_rule,
-    rc.update_rule
-FROM information_schema.referential_constraints rc
-JOIN information_schema.key_column_usage fk
-    ON fk.constraint_catalog = rc.constraint_catalog
-    AND fk.constraint_schema = rc.constraint_schema
-    AND fk.constraint_name = rc.constraint_name
-JOIN information_schema.key_column_usage pk
-    ON pk.constraint_catalog = rc.unique_constraint_catalog
-    AND pk.constraint_schema = rc.unique_constraint_schema
-    AND pk.constraint_name = rc.unique_constraint_name
-    AND pk.ordinal_position = fk.position_in_unique_constraint
-WHERE fk.table_schema = $1
-    AND fk.table_name = $2
-GROUP BY rc.constraint_name, pk.table_schema, pk.table_name, rc.delete_rule, rc.update_rule;`
+    c.conname,
+    ARRAY(SELECT a.attname
+          FROM unnest(c.conkey) WITH ORDINALITY k(attnum, ordinality)
+          JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+          ORDER BY k.ordinality),
+    n.nspname,
+    r.relname,
+    ARRAY(SELECT a.attname
+          FROM unnest(c.confkey) WITH ORDINALITY k(attnum, ordinality)
+          JOIN pg_catalog.pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.attnum
+          ORDER BY k.ordinality),
+    CASE c.confdeltype WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT'
+         WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' END,
+    CASE c.confupdtype WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT'
+         WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' END
+FROM pg_catalog.pg_constraint c
+JOIN pg_catalog.pg_class r ON r.oid = c.confrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = r.relnamespace
+WHERE c.contype = 'f' AND c.conrelid = $1::pg_catalog.regclass
+ORDER BY c.conname, c.oid;`
 
-	rows, err := db.Query(ctx, fkSQL, schema, table)
+	rows, err := db.Query(ctx, fkSQL, pgx.Identifier{schema, table}.Sanitize())
 	if err != nil {
 		return nil, err
 	}
@@ -256,17 +265,13 @@ GROUP BY rc.constraint_name, pk.table_schema, pk.table_name, rc.delete_rule, rc.
 
 func loadReferencedColumns(ctx context.Context, db *pgxpool.Pool, schema, table string) ([]string, error) {
 	const referencedSQL = `
-SELECT DISTINCT pk.column_name
-FROM information_schema.referential_constraints rc
-JOIN information_schema.key_column_usage pk
-    ON pk.constraint_catalog = rc.unique_constraint_catalog
-    AND pk.constraint_schema = rc.unique_constraint_schema
-    AND pk.constraint_name = rc.unique_constraint_name
-WHERE pk.table_schema = $1
-    AND pk.table_name = $2
-ORDER BY pk.column_name;`
+SELECT DISTINCT a.attname
+FROM pg_catalog.pg_constraint c
+JOIN pg_catalog.pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = ANY(c.confkey)
+WHERE c.contype = 'f' AND c.confrelid = $1::pg_catalog.regclass
+ORDER BY a.attname;`
 
-	rows, err := db.Query(ctx, referencedSQL, schema, table)
+	rows, err := db.Query(ctx, referencedSQL, pgx.Identifier{schema, table}.Sanitize())
 	if err != nil {
 		return nil, err
 	}

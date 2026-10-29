@@ -5,10 +5,12 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
 	"github.com/brianvoe/gofakeit/v7"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type dataFaker struct {
@@ -106,7 +108,9 @@ func compileFakeDataRule(selector string, functionConfig string) (fakeDataRule, 
 		return rule, target, nil
 	}
 
-	re, err := regexp.Compile("(?i)^" + normalizeRegexSelector(selector) + "$")
+	// Keep regex escapes intact (for example, \D differs from \d), and
+	// anchor the entire expression, including every branch of an alternation.
+	re, err := regexp.Compile("(?i)^(?:" + selector + ")$")
 	if err != nil {
 		return fakeDataRule{}, "", fmt.Errorf("fake-data %q has invalid regex: %w", selector, err)
 	}
@@ -140,10 +144,6 @@ func exactFakeDataTarget(selector string) (string, string, bool) {
 		return "table", normalized, true
 	}
 	return "column", normalized, true
-}
-
-func normalizeRegexSelector(selector string) string {
-	return normalizeFilterName(selector)
 }
 
 func parseFakeFunctionConfig(value string) (string, []string) {
@@ -271,21 +271,6 @@ func supportedFakeOutput(output string) bool {
 	}
 }
 
-func (f *dataFaker) fakeValue(faker *gofakeit.Faker, table tableMeta, col columnMeta) (any, bool, error) {
-	if f == nil {
-		return nil, false, nil
-	}
-	if faker == nil {
-		faker = gofakeit.GlobalFaker
-	}
-	rule, ok := f.matchRule(table, col)
-	if !ok {
-		return nil, false, nil
-	}
-	value, err := rule.info.Generate(faker, cloneFakeParams(rule.params), &rule.info)
-	return value, true, err
-}
-
 func (f *dataFaker) matchRule(table tableMeta, col columnMeta) (fakeDataRule, bool) {
 	if f == nil {
 		return fakeDataRule{}, false
@@ -348,7 +333,7 @@ func matchingOutputTypes(dataType string) []string {
 	}
 
 	if strings.Contains(dt, "date") || strings.Contains(dt, "timestamp") ||
-		strings.HasPrefix(dt, "time ") {
+		dt == "time" || dt == "timetz" || strings.HasPrefix(dt, "time ") {
 		return []string{"time", "time.Time"}
 	}
 
@@ -378,7 +363,9 @@ func fakerTypeName(column columnMeta) string {
 	return column.UDTName
 }
 
-func availableFakeFunctionOptions() []fakeFunctionOption {
+// The registry is fixed after package initialization. Reuse this read-only
+// catalog instead of probing hundreds of generators on every schema reload.
+var availableFakeFunctionOptions = sync.OnceValue(func() []fakeFunctionOption {
 	probe := gofakeit.New(1)
 	var options []fakeFunctionOption
 	for name, info := range gofakeit.FuncLookups {
@@ -394,7 +381,7 @@ func availableFakeFunctionOptions() []fakeFunctionOption {
 			Display:     info.Display,
 			Category:    info.Category,
 			Description: info.Description,
-			Example:     fmt.Sprintf("%v", info.Example),
+			Example:     info.Example,
 			SearchText:  strings.ToLower(info.Category + " " + info.Display + " " + info.Description + " " + name),
 			Output:      info.Output,
 		}
@@ -412,7 +399,7 @@ func availableFakeFunctionOptions() []fakeFunctionOption {
 		return strings.Compare(a.LookupName, b.LookupName)
 	})
 	return options
-}
+})
 
 func buildFakeFunctionConfigFromEntry(entry tuiFakeDataEntry) string {
 	return buildFakeFunctionConfig(entry.FunctionName, entry.FunctionParams)
@@ -439,7 +426,22 @@ func replaceValue(col columnMeta, fakeValue any) any {
 		return fakeValue
 	case "bool":
 		return fakeValue
-	case "date", "timestamp", "timestamptz", "time", "timetz":
+	case "date", "timestamp", "timestamptz":
+		return fakeValue
+	case "time":
+		if value, ok := fakeValue.(time.Time); ok {
+			microseconds := int64(value.Hour())*int64(time.Hour/time.Microsecond) +
+				int64(value.Minute())*int64(time.Minute/time.Microsecond) +
+				int64(value.Second())*int64(time.Second/time.Microsecond) +
+				int64(value.Nanosecond())/int64(time.Microsecond)
+			return pgtype.Time{Microseconds: microseconds, Valid: true}
+		}
+		return fakeValue
+	case "timetz":
+		if value, ok := fakeValue.(time.Time); ok {
+			// pgx has no timetz codec, so use PostgreSQL's text representation.
+			return value.Format("15:04:05.999999-07:00:00")
+		}
 		return fakeValue
 	case dtUUID:
 		s, ok := fakeValue.(string)

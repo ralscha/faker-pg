@@ -13,7 +13,7 @@ func TestBuildUpdateSQLQuotesIdentifiers(t *testing.T) {
 	primaryKey := []string{"tenant id", "id"}
 
 	got := buildUpdateSQL(table, columns, primaryKey)
-	want := `UPDATE "odd""schema"."user data" SET "full""name" = $1, "email" = $2 WHERE "tenant id" = $3 AND "id" = $4`
+	want := `UPDATE ONLY "odd""schema"."user data" SET "full""name" = $1, "email" = $2 WHERE "tenant id" = $3 AND "id" = $4`
 	if got != want {
 		t.Fatalf("buildUpdateSQL() = %q, want %q", got, want)
 	}

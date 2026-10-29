@@ -19,24 +19,86 @@ func parsePgDSNForm(dsn string) pgDSNForm {
 }
 
 func parsePgURLDSN(dsn string) (pgDSNForm, bool) {
-	u, err := url.Parse(dsn)
-	if err != nil || u.Scheme == "" || u.Host == "" {
+	scheme, rest, ok := strings.Cut(dsn, "://")
+	if !ok || (scheme != pgSchemePostgres && scheme != pgSchemePostgreSQL) {
 		return pgDSNForm{}, false
 	}
-	if u.Scheme != pgSchemePostgres && u.Scheme != pgSchemePostgreSQL {
+	end := strings.IndexAny(rest, "/?")
+	if end < 0 {
+		end = len(rest)
+	}
+	authority := rest[:end]
+	userinfo := ""
+	if at := strings.LastIndexByte(authority, '@'); at >= 0 {
+		userinfo, authority = authority[:at+1], authority[at+1:]
+	}
+	// net/url does not accept every PostgreSQL multi-host authority (for
+	// example host1:5432,host2). Parse the credentials/path separately.
+	u, err := url.Parse(strings.ReplaceAll(scheme+"://"+userinfo+"localhost"+rest[end:], "#", "%23"))
+	if err != nil || u.Scheme == "" {
 		return pgDSNForm{}, false
 	}
 
-	query := u.Query()
+	// PostgreSQL URIs use percent encoding, not HTML form encoding: a
+	// literal '+' is a plus sign, and later duplicate settings take precedence.
+	query := make(url.Values)
+	sslWasLast := false
+	for pair := range strings.SplitSeq(u.RawQuery, "&") {
+		if pair == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(pair, "=")
+		if !ok {
+			return pgDSNForm{}, false
+		}
+		key, keyErr := url.PathUnescape(key)
+		value, valueErr := url.PathUnescape(value)
+		if keyErr != nil || valueErr != nil {
+			return pgDSNForm{}, false
+		}
+		if key == "dbname" {
+			key = "database"
+		}
+		if key == "ssl" || key == "sslmode" {
+			sslWasLast = key == "ssl"
+		}
+		query.Set(key, value)
+	}
+	if query.Get("ssl") == "true" {
+		query.Del("ssl")
+		if sslWasLast {
+			query.Set("sslmode", "require")
+		}
+	}
+	hosts := strings.Split(authority, ",")
+	ports := make([]string, len(hosts))
+	for i, authority := range hosts {
+		host, port := authority, ""
+		if strings.HasPrefix(host, "[") {
+			closeBracket := strings.IndexByte(host, ']')
+			if closeBracket < 0 {
+				return pgDSNForm{}, false
+			}
+			port = strings.TrimPrefix(host[closeBracket+1:], ":")
+			host = host[1:closeBracket]
+		} else {
+			host, port, _ = strings.Cut(host, ":")
+		}
+		host, err := url.PathUnescape(host)
+		if err != nil {
+			return pgDSNForm{}, false
+		}
+		port, err = url.PathUnescape(port)
+		if err != nil {
+			return pgDSNForm{}, false
+		}
+		hosts[i], ports[i] = host, port
+	}
 	form := pgDSNForm{
-		Host:     strings.TrimSpace(u.Hostname()),
-		Port:     strings.TrimSpace(u.Port()),
+		Host:     strings.Join(hosts, ","),
+		Port:     strings.Join(ports, ","),
 		Database: strings.TrimSpace(strings.TrimPrefix(u.Path, "/")),
 		SSLMode:  strings.TrimSpace(query.Get("sslmode")),
-	}
-	query.Del("sslmode")
-	if len(query) > 0 {
-		form.Options = query
 	}
 	if u.User != nil {
 		form.Username = u.User.Username()
@@ -44,18 +106,42 @@ func parsePgURLDSN(dsn string) (pgDSNForm, bool) {
 			form.Password = password
 		}
 	}
+	// Preserve the legacy hostaddr alias when no host was supplied. pgx does
+	// not consume hostaddr and would send it as an invalid server parameter.
+	if form.Host == "" && query.Get("host") == "" {
+		form.Host = query.Get("hostaddr")
+	}
+	query.Del("hostaddr")
+	for key, target := range map[string]*string{
+		"host": &form.Host, "port": &form.Port, "database": &form.Database,
+		"user": &form.Username, "password": &form.Password,
+	} {
+		if values, ok := query[key]; ok {
+			*target = values[0]
+		}
+		query.Del(key)
+	}
+	query.Del("sslmode")
+	if len(query) > 0 {
+		form.Options = query
+	}
 	return form, true
 }
 
 func parsePgKeyValueDSN(dsn string) pgDSNForm {
 	form := pgDSNForm{}
-	for key, value := range parsePgKeyValueSettings(dsn) {
+	settings := parsePgKeyValueSettings(dsn)
+	form.Host = settings["host"]
+	if form.Host == "" {
+		form.Host = settings["hostaddr"]
+	}
+	for key, value := range settings {
 		switch key {
 		case "host", "hostaddr":
-			form.Host = value
+			// Resolved above so precedence does not depend on map iteration.
 		case "port":
 			form.Port = value
-		case "dbname", "database":
+		case "database":
 			form.Database = value
 		case "user":
 			form.Username = value
@@ -102,8 +188,15 @@ func buildPgDSN(form pgDSNForm) string {
 	for key, values := range form.Options {
 		q[key] = append([]string(nil), values...)
 	}
+	// Multi-host and Unix socket addresses belong in the query, where URL
+	// authority escaping cannot change their meaning.
+	if strings.ContainsAny(host, ",/\\") || strings.Contains(port, ",") {
+		u.Host = ""
+		q.Set("host", host)
+		q.Set("port", port)
+	}
 	q.Set("sslmode", sslmode)
-	u.RawQuery = q.Encode()
+	u.RawQuery = strings.ReplaceAll(q.Encode(), "+", "%20")
 	return u.String()
 }
 
@@ -154,6 +247,9 @@ func parsePgKeyValueSettings(dsn string) map[string]string {
 			}
 			value.WriteByte(character)
 			position++
+		}
+		if key == "dbname" {
+			key = "database"
 		}
 		settings[key] = value.String()
 	}

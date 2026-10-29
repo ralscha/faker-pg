@@ -32,6 +32,15 @@ tasks:
       - go test -coverprofile=coverage.out ./...
       - go tool cover -func=coverage.out
 
+  test:integration:
+    desc: Run tests against a disposable PostgreSQL database (requires TEST_DSN)
+    requires:
+      vars: [TEST_DSN]
+    env:
+      FAKER_PG_TEST_DSN: '{{.TEST_DSN}}'
+    cmds:
+      - go test -v ./...
+
   run:
     desc: Launch the TUI
     summary: |

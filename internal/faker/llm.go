@@ -157,13 +157,12 @@ func preferredSensitiveFakeFunctions(options []fakeFunctionOption) []fakeFunctio
 		"email",
 		"username",
 		"password",
-		"phonenumber",
+		"phone",
 		"street",
 		"city",
 		"state",
 		"zip",
 		"country",
-		"address",
 		"ssn",
 		"company",
 		"jobtitle",
@@ -176,7 +175,7 @@ func preferredSensitiveFakeFunctions(options []fakeFunctionOption) []fakeFunctio
 		"creditcardcvv",
 		"creditcardexp",
 		"date",
-		"dateofbirth",
+		"pastdate",
 	}
 	byName := make(map[string]fakeFunctionOption, len(options))
 	for _, option := range options {

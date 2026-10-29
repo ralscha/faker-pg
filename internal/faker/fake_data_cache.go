@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 const (
@@ -36,36 +36,6 @@ func cachePath() (string, error) {
 	return filepath.Join(home, cacheDirName, cacheFileName), nil
 }
 
-func loadCachedEntries(dsn string) ([]tuiFakeDataEntry, bool, error) {
-	cacheKey := pgDSNCacheKey(dsn)
-	if cacheKey == "" {
-		return nil, false, nil
-	}
-
-	path, err := cachePath()
-	if err != nil {
-		return nil, false, err
-	}
-	raw, err := os.ReadFile(path) //nolint:gosec // path is derived from os.UserHomeDir(), not user input
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, false, nil
-		}
-		return nil, false, fmt.Errorf("read cache %q: %w", path, err)
-	}
-
-	var persisted persistedMappings
-	if err := yaml.Unmarshal(raw, &persisted); err != nil {
-		return nil, false, fmt.Errorf("parse cache %q: %w", path, err)
-	}
-	for _, key := range pgDSNCacheKeys(dsn) {
-		if entries, ok := persisted.Sources[key]; ok {
-			return decodeEntries(entries), true, nil
-		}
-	}
-	return nil, false, nil
-}
-
 func saveCachedEntries(dsn string, entries []tuiFakeDataEntry) error {
 	cacheKey := pgDSNCacheKey(dsn)
 	if cacheKey == "" {
@@ -77,14 +47,9 @@ func saveCachedEntries(dsn string, entries []tuiFakeDataEntry) error {
 		return err
 	}
 
-	persisted := persistedMappings{}
-	raw, err := os.ReadFile(path) //nolint:gosec // path is derived from os.UserHomeDir(), not user input
-	if err == nil {
-		if unmarshalErr := yaml.Unmarshal(raw, &persisted); unmarshalErr != nil {
-			return fmt.Errorf("parse cache %q: %w", path, unmarshalErr)
-		}
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("read cache %q: %w", path, err)
+	persisted, err := readMappingCache(path)
+	if err != nil {
+		return err
 	}
 
 	if persisted.Sources == nil {
@@ -94,24 +59,9 @@ func saveCachedEntries(dsn string, entries []tuiFakeDataEntry) error {
 	if persisted.Mappings == nil {
 		persisted.Mappings = make(map[string]map[string]string)
 	}
-	mappings := entriesToMappings(entries)
-	if len(mappings) == 0 {
-		delete(persisted.Mappings, cacheKey)
-	} else {
-		persisted.Mappings[cacheKey] = mappings
-	}
-
-	encoded, err := yaml.Marshal(persisted)
-	if err != nil {
-		return fmt.Errorf("marshal cache: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("create cache dir %q: %w", filepath.Dir(path), err)
-	}
-	if err := os.WriteFile(path, encoded, 0o600); err != nil {
-		return fmt.Errorf("write cache %q: %w", path, err)
-	}
-	return nil
+	// Retain empty mappings so clearing the editor cannot revive legacy rules.
+	persisted.Mappings[cacheKey] = entriesToMappings(entries)
+	return writeMappingCache(path, persisted)
 }
 
 func loadCachedMappings(dsn string) (map[string]string, bool, error) {
@@ -124,21 +74,16 @@ func loadCachedMappings(dsn string) (map[string]string, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	raw, err := os.ReadFile(path) //nolint:gosec // path is derived from os.UserHomeDir(), not user input
+	persisted, err := readMappingCache(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, false, nil
-		}
-		return nil, false, fmt.Errorf("read cache %q: %w", path, err)
-	}
-
-	var persisted persistedMappings
-	if err := yaml.Unmarshal(raw, &persisted); err != nil {
-		return nil, false, fmt.Errorf("parse cache %q: %w", path, err)
+		return nil, false, err
 	}
 	for _, key := range pgDSNCacheKeys(dsn) {
-		if mappings, ok := persisted.Mappings[key]; ok && len(mappings) > 0 {
+		if mappings, ok := persisted.Mappings[key]; ok {
 			return cloneStringMap(mappings), true, nil
+		}
+		if entries, ok := persisted.Sources[key]; ok {
+			return entriesToMappings(decodeEntries(entries)), true, nil
 		}
 	}
 	return nil, false, nil
@@ -155,25 +100,35 @@ func saveCachedMappings(dsn string, mappings map[string]string) error {
 		return err
 	}
 
-	persisted := persistedMappings{}
-	raw, err := os.ReadFile(path) //nolint:gosec // path is derived from os.UserHomeDir(), not user input
-	if err == nil {
-		if unmarshalErr := yaml.Unmarshal(raw, &persisted); unmarshalErr != nil {
-			return fmt.Errorf("parse cache %q: %w", path, unmarshalErr)
-		}
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("read cache %q: %w", path, err)
+	persisted, err := readMappingCache(path)
+	if err != nil {
+		return err
 	}
 
 	if persisted.Mappings == nil {
 		persisted.Mappings = make(map[string]map[string]string)
 	}
-	if len(mappings) == 0 {
-		delete(persisted.Mappings, cacheKey)
-	} else {
-		persisted.Mappings[cacheKey] = cloneStringMap(mappings)
-	}
+	persisted.Mappings[cacheKey] = cloneStringMap(mappings)
+	delete(persisted.Sources, cacheKey)
+	return writeMappingCache(path, persisted)
+}
 
+func readMappingCache(path string) (persistedMappings, error) {
+	persisted := persistedMappings{}
+	raw, err := os.ReadFile(path) //nolint:gosec // path is derived from os.UserHomeDir(), not user input
+	if os.IsNotExist(err) {
+		return persisted, nil
+	}
+	if err != nil {
+		return persisted, fmt.Errorf("read cache %q: %w", path, err)
+	}
+	if err := yaml.Unmarshal(raw, &persisted); err != nil {
+		return persisted, fmt.Errorf("parse cache %q: %w", path, err)
+	}
+	return persisted, nil
+}
+
+func writeMappingCache(path string, persisted persistedMappings) error {
 	encoded, err := yaml.Marshal(persisted)
 	if err != nil {
 		return fmt.Errorf("marshal cache: %w", err)
@@ -181,7 +136,21 @@ func saveCachedMappings(dsn string, mappings map[string]string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("create cache dir %q: %w", filepath.Dir(path), err)
 	}
-	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+	// Write the complete replacement beside the old file before renaming it,
+	// so a failed write does not destroy previously saved mappings.
+	temp, err := os.CreateTemp(filepath.Dir(path), ".mapping-*")
+	if err != nil {
+		return fmt.Errorf("create temporary cache: %w", err)
+	}
+	defer func() { _ = os.Remove(temp.Name()) }()
+	if _, err := temp.Write(encoded); err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("write cache %q: %w", path, err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("close cache %q: %w", path, err)
+	}
+	if err := os.Rename(temp.Name(), path); err != nil {
 		return fmt.Errorf("write cache %q: %w", path, err)
 	}
 	return nil

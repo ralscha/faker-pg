@@ -7,10 +7,12 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/brianvoe/gofakeit/v7"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/ralscha/faker-pg/internal/pgutil"
 )
 
 type anonymizationResult struct {
@@ -35,7 +37,7 @@ type anonymizationTableResult struct {
 func runAnonymization(ctx context.Context, cfg config) anonymizationResult {
 	poolCfg, err := pgxpool.ParseConfig(cfg.DSN)
 	if err != nil {
-		return anonymizationResult{err: fmt.Errorf("parse DSN: %w", err)}
+		return anonymizationResult{err: fmt.Errorf("parse DSN: %w", pgutil.RedactParseError(err))}
 	}
 	workers := max(1, cfg.Workers)
 	poolCfg.MaxConns = int32(min(workers, math.MaxInt32))
@@ -212,15 +214,26 @@ func anonymizeTable(
 	if len(fakedColumns) == 0 {
 		return 0, nil
 	}
+	// Resolve selectors once per column, not once per cell in every batch.
+	rules := make([]fakeDataRule, len(fakedColumns))
+	for i, column := range fakedColumns {
+		rule, matched := dataFaker.matchRule(table, column)
+		if !matched {
+			return 0, fmt.Errorf("no faker rule for %s", column.Name)
+		}
+		rules[i] = rule
+	}
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("begin transaction: %w", err)
 	}
 	defer func() {
-		if err != nil {
-			_ = tx.Rollback(context.Background())
-		}
+		// Rollback also releases the connection when generation panics. It is a
+		// no-op after Commit and must not inherit an already cancelled context.
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tx.Rollback(rollbackCtx)
 	}()
 
 	selectColumns := make([]string, len(primaryKeyColumns))
@@ -229,7 +242,7 @@ func anonymizeTable(
 	}
 	const cursorName = "faker_pg_rows"
 	declareSQL := fmt.Sprintf(
-		"DECLARE %s NO SCROLL CURSOR FOR SELECT %s FROM %s ORDER BY %s",
+		"DECLARE %s NO SCROLL CURSOR FOR SELECT %s FROM ONLY %s ORDER BY %s",
 		pgx.Identifier{cursorName}.Sanitize(),
 		strings.Join(selectColumns, ", "),
 		table.FQTN(),
@@ -253,13 +266,11 @@ func anonymizeTable(
 		batch := &pgx.Batch{}
 		for _, primaryKey := range primaryKeys {
 			args := make([]any, 0, len(fakedColumns)+len(primaryKey))
-			for _, column := range fakedColumns {
-				fakeValue, matched, fakeErr := dataFaker.fakeValue(valueFaker, table, column)
+			for i, column := range fakedColumns {
+				rule := &rules[i]
+				fakeValue, fakeErr := rule.info.Generate(valueFaker, cloneFakeParams(rule.params), &rule.info)
 				if fakeErr != nil {
 					return totalRows, fmt.Errorf("generate fake for %s: %w", column.Name, fakeErr)
-				}
-				if !matched {
-					return totalRows, fmt.Errorf("faker rule for %s disappeared during execution", column.Name)
 				}
 				args = append(args, replaceValue(column, fakeValue))
 			}
@@ -304,9 +315,9 @@ func fetchPrimaryKeyBatch(ctx context.Context, tx pgx.Tx, cursorName string, col
 	defer rows.Close()
 
 	var primaryKeys [][]any
+	targets := make([]any, columnCount)
 	for rows.Next() {
 		values := make([]any, columnCount)
-		targets := make([]any, columnCount)
 		for i := range values {
 			targets[i] = &values[i]
 		}
@@ -331,7 +342,7 @@ func buildUpdateSQL(table tableMeta, fakedColumns []columnMeta, primaryKeyColumn
 		whereClauses[i] = fmt.Sprintf("%s = $%d", pgx.Identifier{column}.Sanitize(), len(fakedColumns)+i+1)
 	}
 	return fmt.Sprintf(
-		"UPDATE %s SET %s WHERE %s",
+		"UPDATE ONLY %s SET %s WHERE %s",
 		table.FQTN(),
 		strings.Join(setClauses, ", "),
 		strings.Join(whereClauses, " AND "),

@@ -19,9 +19,9 @@ faker-pg -- PostgreSQL Fake Data Anonymizer
 ## Features
 
 - **Interactive TUI** — navigate with keyboard; no config files required
-- **Schema discovery** — reads tables, columns, primary keys, and foreign keys from `information_schema`
+- **Schema discovery** — reads tables, columns, primary keys, and foreign keys from PostgreSQL metadata, including references to unique indexes
 - **Column filtering** — include/exclude schemas or tables by name
-- **600+ fake generators** — every [gofakeit](https://github.com/brianvoe/gofakeit) function, searchable by name or category
+- **Searchable fake generators** — supported scalar [gofakeit](https://github.com/brianvoe/gofakeit) functions, searchable by name or category
 - **Type-aware picker** — shows only generators whose output type is compatible with the target column
 - **Parameterised functions** — pass arguments to generators (e.g. `numerify` format strings)
 - **Regex selectors** — map a single rule to multiple columns via a pattern
@@ -29,11 +29,11 @@ faker-pg -- PostgreSQL Fake Data Anonymizer
 - **Batched parallel execution** — update rows in bounded batches and process independent tables concurrently
 - **LLM auto-select** — uses any OpenAI-compatible model to suggest mappings for sensitive columns
 - **Persistent cache** — mappings are saved to `~/.faker-pg/fake-data-mapping.yml` and restored on next run
-- **Remote host guard** — confirms before touching a non-localhost database
+- **Remote host guard** — confirms before updating a remote database, including fallback hosts in multi-host DSNs
 
 ## Requirements
 
-- Go 1.27.1+
+- Go 1.27.3+
 - PostgreSQL 12+ (accessed over TCP; unix sockets are not tested)
 - _(Optional)_ Docker — for the `task dev:db:*` helpers
 - _(Optional)_ An OpenAI-compatible API key — for LLM auto-select
@@ -72,7 +72,7 @@ faker-pg --dsn "postgres://user:pass@localhost:5432/mydb?sslmode=disable"
 faker-pg \
   --dsn "postgres://user:pass@localhost:5432/mydb?sslmode=disable" \
   --fake-data "email=email" \
-  --fake-data 'public\..*\.phone=phonenumber'
+  --fake-data 'public\..*\.phone=phone'
 
 # Pre-fill the DSN and configure the LLM for auto-select
 faker-pg \
@@ -149,11 +149,15 @@ Press `^A` from the connection form to start. faker-pg will:
 
 1. Parse the fake-data rules
 2. Connect to PostgreSQL and load the current schema
-3. For each table that has at least one mapped column, replace values in transactional database batches
+3. For each table that has at least one mapped column, replace values in bounded batches within one transaction per table
 4. Process up to `--workers` tables concurrently
 5. Report the total rows and tables updated
 
 A confirmation screen is shown before touching any non-localhost host.
+
+Each table is committed atomically. A failure rolls back that table, including earlier batches; tables already committed remain changed. Quitting cancels outstanding database and LLM work. Press `Enter` or `Esc` on the results screen to return to the connection form.
+
+Table filters and mappings apply to physical tables. Inherited child tables and partition leaves are processed separately, so excluding a child prevents its rows from being changed through a parent. For partitioned tables, select the leaf partitions; explicitly including a storage-free partition root reports an error explaining this requirement.
 
 ## CLI flags
 
@@ -173,6 +177,9 @@ A confirmation screen is shown before touching any non-localhost host.
 | `--llm-api-key` | _(empty)_ | Inline API key (prefer `--llm-api-key-env` instead) |
 | `--llm-api-key-env` | `OPENAI_API_KEY` | Environment variable to read the API key from |
 | `--verbose` | `false` | Enable verbose logging |
+| `--version` | `false` | Print the build version and exit |
+
+`--batch-size` and `--workers` must be positive integers. Invalid values and unexpected positional arguments are rejected before the TUI starts.
 
 ## Fake-data selectors
 
@@ -187,6 +194,7 @@ Rules are matched from most to least specific:
 
 Selectors are case-insensitive. Quoted identifiers (`"MyTable"`) are normalised to lower-case.
 Use `--fake-data` to configure generic and regex selectors; rules selected in the editor are stored as exact selectors.
+Regex selectors match the entire qualified column name, including every branch of an alternation; escapes such as `\D` and `\S` retain their regular-expression meaning.
 
 ### Function parameters
 
@@ -215,6 +223,9 @@ task test
 # Run tests with coverage report
 task test:cover
 
+# Run integration tests in a disposable PostgreSQL database
+task test:integration TEST_DSN="postgres://postgres:postgres@localhost:5432/devdb?sslmode=disable"
+
 # Format code
 task format
 
@@ -228,6 +239,7 @@ task build
 task run DSN="postgres://postgres:postgres@localhost:5432/devdb?sslmode=disable"
 ```
 
+The integration suite creates and removes isolated test schemas. Plain `go test ./...` skips these tests unless `FAKER_PG_TEST_DSN` is set. CI runs them against PostgreSQL with the Go race detector enabled.
 
 ## License
 

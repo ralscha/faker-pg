@@ -6,11 +6,13 @@ on:
       - '**/*.go'
       - go.mod
       - go.sum
+      - .github/workflows/test.yml
   pull_request:
     paths:
       - '**/*.go'
       - go.mod
       - go.sum
+      - .github/workflows/test.yml
 
 permissions:
   contents: read
@@ -19,6 +21,23 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: faker_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d faker_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      FAKER_PG_TEST_DSN: postgres://postgres:postgres@localhost:5432/faker_test?sslmode=disable
 
     steps:
       - name: Check out repository
@@ -29,5 +48,8 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Run Go tests
-        run: go test ./...
+      - name: Vet Go code
+        run: go vet ./...
+
+      - name: Run unit and PostgreSQL integration tests
+        run: go test -race ./...

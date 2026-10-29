@@ -12,6 +12,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/ralscha/faker-pg/internal/pgutil"
 )
 
 type tuiScreen int
@@ -50,6 +51,7 @@ type executionDoneMsg struct {
 type tuiModel struct {
 	cfg    config
 	screen tuiScreen
+	ctx    context.Context
 
 	formInputs []textinput.Model
 
@@ -71,6 +73,7 @@ type tuiModel struct {
 	quitting        bool
 	runInProgress   bool
 	pendingFakeCfg  config
+	remoteHosts     []string
 	formAction      int // 0=text inputs, 1=edit button, 2=start button
 	logLines        []string
 	logScroll       int
@@ -175,6 +178,7 @@ func newTUIModel(cfg config) tuiModel {
 
 	return tuiModel{
 		cfg:           cfg,
+		ctx:           context.Background(),
 		screen:        tuiScreenForm,
 		formInputs:    inputs,
 		fakeDataTable: fakeDataTable,
@@ -277,6 +281,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tuiScreenFakerPicker:
 			var cmd tea.Cmd
 			m.pickerInput, cmd = m.pickerInput.Update(msg)
+			m.pickerCursor = 0
 			return m, cmd
 		case tuiScreenFakerParams:
 			var cmd tea.Cmd
@@ -508,8 +513,7 @@ func (m tuiModel) fakerParamsView() string {
 }
 
 func (m tuiModel) confirmRemoteView() string {
-	host := strings.TrimSpace(m.formInputs[0].Value())
-	msg := fmt.Sprintf("Target host %q is not local.\n\nAre you sure you want to continue?", host)
+	msg := fmt.Sprintf("Target host(s) %q are not local.\n\nAre you sure you want to continue?", strings.Join(m.remoteHosts, ", "))
 
 	var b strings.Builder
 	b.WriteString(confirmStyle.Render(msg))
@@ -594,17 +598,12 @@ func (m tuiModel) updateForm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.handleFormEnter()
 	case "left":
 		if m.formAction > 0 {
-			m.formAction--
+			return m.cycleFormFocus(-1), nil
 		}
-		return m, nil
 	case "right":
 		if m.formAction > 0 {
-			m.formAction++
-			if m.formAction > 2 {
-				m.formAction = 2
-			}
+			return m.cycleFormFocus(1), nil
 		}
-		return m, nil
 	case "ctrl+f":
 		m.formAction = 1
 		return m.handleFormEnter()
@@ -661,6 +660,11 @@ func (m tuiModel) cycleFormFocus(direction int) tuiModel {
 }
 
 func (m tuiModel) handleFormEnter() (tea.Model, tea.Cmd) {
+	if m.formAction > 0 {
+		for i := range m.formInputs {
+			m.formInputs[i].Blur()
+		}
+	}
 	cfg, err := m.configFromForm()
 	if err != nil {
 		m.status = err.Error()
@@ -682,8 +686,14 @@ func (m tuiModel) handleFormEnter() (tea.Model, tea.Cmd) {
 			m.status = "No fake data rules configured. Edit fake data first."
 			return m, nil
 		}
-		if !isLocalHost(m.formInputs[0].Value()) {
+		remoteHosts, err := remoteDatabaseHosts(cfg.DSN)
+		if err != nil {
+			m.status = "Invalid connection settings: " + pgutil.RedactParseError(err).Error()
+			return m, nil
+		}
+		if len(remoteHosts) > 0 {
 			m.pendingFakeCfg = cfg
+			m.remoteHosts = remoteHosts
 			m.screen = tuiScreenConfirmRemote
 			m.status = ""
 			return m, nil
@@ -691,12 +701,34 @@ func (m tuiModel) handleFormEnter() (tea.Model, tea.Cmd) {
 		m.runInProgress = true
 		m.screen = tuiScreenExecuting
 		m.status = "Starting anonymization..."
-		return m, executeAnonymizationCmd(cfg)
+		return m, executeAnonymizationCmd(m.ctx, cfg)
 	}
 
 	m.screen = tuiScreenLoadingSchema
 	m.status = "Connecting to PostgreSQL to discover schema..."
-	return m, loadSchemaCmd(cfg)
+	return m, loadSchemaCmd(m.ctx, cfg)
+}
+
+// Inspect pgx's effective hosts, including fallback hosts, rather than just
+// the displayed field: connection options can also specify the destination.
+func remoteDatabaseHosts(dsn string) ([]string, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	hosts := []string{cfg.ConnConfig.Host}
+	for _, fallback := range cfg.ConnConfig.Fallbacks {
+		hosts = append(hosts, fallback.Host)
+	}
+	var remote []string
+	seen := make(map[string]bool)
+	for _, host := range hosts {
+		if !isLocalHost(host) && !seen[host] {
+			remote = append(remote, host)
+			seen[host] = true
+		}
+	}
+	return remote, nil
 }
 
 func (m *tuiModel) configFromForm() (config, error) {
@@ -817,7 +849,7 @@ func (m tuiModel) updateFakeData(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			if len(unmapped) > 0 {
 				entries = unmapped
 			}
-			return m, autoSelectCmd(m.cfg.LLM, entries, m.fakeFunctions)
+			return m, autoSelectCmd(m.ctx, m.cfg.LLM, entries, m.fakeFunctions)
 		}
 		m.status = "LLM is not configured. Set Model and API Key first."
 		return m, nil
@@ -854,6 +886,9 @@ func (m tuiModel) updateFakerPicker(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 					m.paramTarget = target
 					m.paramOption = selected
 					m.paramInput.Reset()
+					if m.fakeDataEntries[target].FunctionName == selected.LookupName {
+						m.paramInput.SetValue(strings.Join(m.fakeDataEntries[target].FunctionParams, ";"))
+					}
 					m.screen = tuiScreenFakerParams
 					return m, nil
 				}
@@ -911,7 +946,7 @@ func (m tuiModel) updateConfirmRemote(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 		m.runInProgress = true
 		m.screen = tuiScreenExecuting
 		m.status = "Starting anonymization..."
-		return m, executeAnonymizationCmd(m.pendingFakeCfg)
+		return m, executeAnonymizationCmd(m.ctx, m.pendingFakeCfg)
 	case "n", keyEsc:
 		m.screen = tuiScreenForm
 		m.pendingFakeCfg = config{}
@@ -930,7 +965,7 @@ func (m tuiModel) updateExecutionResult(msg tea.KeyPressMsg) (tea.Model, tea.Cmd
 		m.quitting = true
 		return m, tea.Quit
 	case keyEnter, keyEsc:
-		m.screen = tuiScreenFakeData
+		m.screen = tuiScreenForm
 		return m, nil
 	case "up", "k":
 		if m.logScroll > 0 {
@@ -952,7 +987,7 @@ func (m tuiModel) executionResultView() string {
 	b.WriteString("\n")
 
 	visibleRows := max(4, m.height-12)
-	start := m.logScroll
+	start := min(m.logScroll, max(0, len(m.logLines)-visibleRows))
 	end := min(start+visibleRows, len(m.logLines))
 
 	checkMark := lipgloss.NewStyle().Foreground(colorAccent).Render("✓")
@@ -970,16 +1005,15 @@ func (m tuiModel) executionResultView() string {
 		}
 	}
 
-	b.WriteString(helpStyle.Render("  up/dn or j/k scroll  |  enter or esc back to data table  |  q quits"))
+	b.WriteString(helpStyle.Render("  up/dn or j/k scroll  |  enter or esc back to connection form  |  q quits"))
 	return b.String()
 }
 
-func loadSchemaCmd(cfg config) tea.Cmd {
+func loadSchemaCmd(ctx context.Context, cfg config) tea.Cmd {
 	return func() tea.Msg {
-		ctx := context.Background()
 		poolCfg, err := pgxpool.ParseConfig(cfg.DSN)
 		if err != nil {
-			return schemaLoadedMsg{err: fmt.Errorf("parse DSN: %w", err)}
+			return schemaLoadedMsg{err: fmt.Errorf("parse DSN: %w", pgutil.RedactParseError(err))}
 		}
 		poolCfg.MaxConns = 4
 		pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
@@ -1009,23 +1043,6 @@ func loadSchemaCmd(cfg config) tea.Cmd {
 			}
 		}
 
-		cached, found, err := loadCachedEntries(cfg.DSN)
-		if err != nil {
-			return schemaLoadedMsg{err: err}
-		}
-		if found && len(cached) > 0 {
-			cachedBySelector := make(map[string]tuiFakeDataEntry, len(cached))
-			for _, c := range cached {
-				cachedBySelector[c.Selector] = c
-			}
-			for i, entry := range entries {
-				if c, ok := cachedBySelector[entry.Selector]; ok {
-					entries[i].FunctionName = c.FunctionName
-					entries[i].FunctionDisplay = c.FunctionDisplay
-					entries[i].FunctionParams = c.FunctionParams
-				}
-			}
-		}
 		mappings := cfg.FakeData
 		if len(mappings) == 0 {
 			cachedMappings, found, err := loadCachedMappings(cfg.DSN)
@@ -1044,9 +1061,9 @@ func loadSchemaCmd(cfg config) tea.Cmd {
 	}
 }
 
-func autoSelectCmd(llmCfg llmConfig, entries []tuiFakeDataEntry, options []fakeFunctionOption) tea.Cmd {
+func autoSelectCmd(ctx context.Context, llmCfg llmConfig, entries []tuiFakeDataEntry, options []fakeFunctionOption) tea.Cmd {
 	return func() tea.Msg {
-		selections, err := autoSelectFakeDataWithLLM(context.Background(), llmCfg, entries, options)
+		selections, err := autoSelectFakeDataWithLLM(ctx, llmCfg, entries, options)
 		return autoSelectDoneMsg{selections: selections, err: err}
 	}
 }
@@ -1092,9 +1109,9 @@ func applyMappingsToEntries(entries []tuiFakeDataEntry, mappings map[string]stri
 	return nil
 }
 
-func executeAnonymizationCmd(cfg config) tea.Cmd {
+func executeAnonymizationCmd(ctx context.Context, cfg config) tea.Cmd {
 	return func() tea.Msg {
-		result := runAnonymization(context.Background(), cfg)
+		result := runAnonymization(ctx, cfg)
 		return executionDoneMsg(result)
 	}
 }
@@ -1136,7 +1153,10 @@ func (t tableMeta) PrimaryKeyColumns() []string {
 }
 
 func runTUI(cfg config) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	model := newTUIModel(cfg)
+	model.ctx = ctx
 	if cfg.DSN != "" {
 		form := parsePgDSNForm(cfg.DSN)
 		model.formInputs[0].SetValue(form.Host)
